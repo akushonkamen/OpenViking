@@ -6,7 +6,6 @@ import time
 
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
-import volcenginesdkarkruntime
 from openviking_cli.utils.logger import default_logger as logger
 
 from openviking.models.embedder.base import (
@@ -79,7 +78,21 @@ async def _measure_embedding_call_async(
         raise
 
 
+def _import_arkruntime():
+    """Import the Ark runtime client lazily so the embedder package stays
+    importable when ``volcenginesdkarkruntime`` is not installed (it is absent
+    from ``volcengine-python-sdk`` >= 5.0.51)."""
+    try:
+        import volcenginesdkarkruntime
+    except ImportError:
+        raise ImportError(
+            "Please install volcenginesdkarkruntime: pip install volcenginesdkarkruntime"
+        )
+    return volcenginesdkarkruntime
+
+
 def _create_sync_ark(kwargs: Dict[str, Any]):
+    volcenginesdkarkruntime = _import_arkruntime()
     client_kwargs = dict(kwargs)
     http_client = create_optional_sync_httpx_client(
         client_kwargs.get("base_url"),
@@ -91,6 +104,7 @@ def _create_sync_ark(kwargs: Dict[str, Any]):
 
 
 def _create_async_ark(kwargs: Dict[str, Any]):
+    volcenginesdkarkruntime = _import_arkruntime()
     client_kwargs = dict(kwargs)
     http_client = create_optional_async_httpx_client(
         client_kwargs.get("base_url"),

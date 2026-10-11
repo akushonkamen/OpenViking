@@ -3765,7 +3765,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.39.0" },
     { name = "uvloop", marker = "sys_platform != 'win32' and extra == 'gateway-fast'", specifier = ">=0.21" },
     { name = "volcengine", specifier = ">=1.0.216" },
-    { name = "volcengine-python-sdk", extras = ["ark"], specifier = ">=5.0.3" },
+    { name = "volcengine-python-sdk", extras = ["ark"], specifier = ">=5.0.3,<5.0.51" },
     { name = "websocket-client", marker = "extra == 'bot'", specifier = ">=1.6.0" },
     { name = "websockets", marker = "extra == 'bot'", specifier = ">=12.0" },
     { name = "wheel", marker = "extra == 'build'" },

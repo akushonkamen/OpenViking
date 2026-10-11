@@ -18,7 +18,7 @@ _MULTIMODAL_INPUT = [
 ]
 
 
-@patch("openviking.models.embedder.volcengine_embedders.volcenginesdkarkruntime.Ark")
+@patch("volcenginesdkarkruntime.Ark")
 def test_sparse_embedder_downgrades_multimodal_input_to_text(_mock_ark):
     embedder = VolcengineSparseEmbedder(model_name="test", api_key="test-key")
 
@@ -26,7 +26,7 @@ def test_sparse_embedder_downgrades_multimodal_input_to_text(_mock_ark):
     assert embedder.prepare_embedding_input(_MULTIMODAL_INPUT) == "diagram of a heat exchanger"
 
 
-@patch("openviking.models.embedder.volcengine_embedders.volcenginesdkarkruntime.Ark")
+@patch("volcenginesdkarkruntime.Ark")
 def test_hybrid_embedder_downgrades_multimodal_input_to_text(_mock_ark):
     embedder = VolcengineHybridEmbedder(model_name="test", api_key="test-key")
 
@@ -34,7 +34,7 @@ def test_hybrid_embedder_downgrades_multimodal_input_to_text(_mock_ark):
     assert embedder.prepare_embedding_input(_MULTIMODAL_INPUT) == "diagram of a heat exchanger"
 
 
-@patch("openviking.models.embedder.volcengine_embedders.volcenginesdkarkruntime.Ark")
+@patch("volcenginesdkarkruntime.Ark")
 @patch("openviking.models.embedder.volcengine_embedders.time.perf_counter")
 def test_dense_embedder_passes_local_provider_duration_to_metrics(mock_perf_counter, mock_ark):
     """Embedding call duration must come from this SDK request, not shared embedder state."""
