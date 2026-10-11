@@ -31,6 +31,25 @@ from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Replay budget for one add_resource queue message. A delivery whose handler
+# dies with the whole process (uncatchable native crash, e.g. pdfium.dll on
+# Windows) leaves the durable message in `processing`; RecoverStale resets it
+# to `pending` on every startup with the payload unchanged, so the same
+# message_id would otherwise be replayed — and crash again — forever. The
+# counter is persisted in the task record's meta (the durable store that
+# already survives restarts) before any crash-prone work starts.
+MAX_ADD_RESOURCE_DELIVERY_ATTEMPTS = 3
+_DELIVERY_ATTEMPT_FIELD = "delivery_attempt"
+
+
+def _delivery_attempt(task: Any) -> int:
+    """Read the persisted delivery counter from the task record."""
+    meta = getattr(task, "meta", None)
+    try:
+        return max(0, int(meta.get(_DELIVERY_ATTEMPT_FIELD) or 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
 
 class AddResourceProcessor(DequeueHandlerBase):
     """Own an add-resource task until it reaches a terminal state and can be ACKed."""
@@ -176,6 +195,53 @@ class AddResourceProcessor(DequeueHandlerBase):
             await self._record_watch_execution(msg, status, getattr(task, "error", None))
             unregister_telemetry(telemetry_id)
             return ProcessResult.success()
+
+        delivery_attempt = _delivery_attempt(task)
+        if delivery_attempt >= MAX_ADD_RESOURCE_DELIVERY_ATTEMPTS:
+            # Poison message: this delivery has been replayed after
+            # MAX_ADD_RESOURCE_DELIVERY_ATTEMPTS process deaths without ever
+            # reaching a handler failure (e.g. a native parser crash killing
+            # the whole server). Dead-letter it — returning FAILED lets
+            # NamedQueue.ack remove the message for good — so the server can
+            # start while it exists, and mark the task failed instead of
+            # leaving it stuck in `running`.
+            error = (
+                f"add_resource exceeded its delivery budget: {delivery_attempt} attempts "
+                "replayed the message after repeated process crashes (most likely an "
+                "uncatchable native parser failure) with no progress. The queue message "
+                "has been removed; the resource was not imported. Resolve the failing "
+                "source (e.g. replace or remove the file) and submit the request again."
+            )
+            logger.error(
+                "[AddResourceDeadLetter] %s deliveries=%d queue=%s",
+                log_correlation(task_id=msg.task_id, telemetry_id=telemetry_id),
+                delivery_attempt,
+                self._queue_name,
+            )
+            with suppress(Exception):
+                await self._cleanup_staged_source(msg, ctx)
+            with suppress(Exception):
+                await self._cleanup_prepared_artifact(msg, ctx)
+            await tracker.fail(
+                msg.task_id,
+                error,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+            )
+            await self._record_watch_execution(msg, "failed", error)
+            unregister_telemetry(telemetry_id)
+            return ProcessResult.failed(error)
+
+        # Persist the next attempt's budget before any crash-prone work so a
+        # hard death still counts against the replay budget on the next startup.
+        with suppress(Exception):
+            await tracker.update_stage(
+                msg.task_id,
+                getattr(task, "stage", None) or "queued",
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+                meta={_DELIVERY_ATTEMPT_FIELD: delivery_attempt + 1},
+            )
 
         metadata = extract_task_metadata(data)
         replay_result = getattr(task, "result", None)
