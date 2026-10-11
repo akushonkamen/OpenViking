@@ -8,6 +8,8 @@ import pytest
 
 from openviking.message import Message, TextPart
 from openviking.session.extraction_batch import (
+    DEFAULT_EXTRACTION_BATCH_MAX_MESSAGE_TOKENS,
+    DEFAULT_EXTRACTION_BATCH_MAX_MESSAGES,
     ExtractionBatchLimits,
     plan_extraction_batches,
     resolve_extraction_batch_limits,
@@ -28,8 +30,57 @@ def test_auto_commit_policy_resolves_phase2_batch_limits():
     )
 
     assert limits == ExtractionBatchLimits(max_message_tokens=8000, max_messages=40)
-    assert resolve_extraction_batch_limits(None).enabled is False
-    assert resolve_extraction_batch_limits({}).enabled is False
+
+
+def test_missing_policy_resolves_to_default_chunking_limits():
+    """#5894: without a policy, extraction still chunks oversized sessions.
+
+    The old behavior returned disabled limits so the entire archived session
+    went through one ExtractLoop pass and failed with parse_error on large
+    sessions; the defaults keep small sessions in a single batch and split
+    oversized ones at message boundaries.
+    """
+    limits = resolve_extraction_batch_limits(None)
+
+    assert limits == ExtractionBatchLimits(
+        max_message_tokens=DEFAULT_EXTRACTION_BATCH_MAX_MESSAGE_TOKENS,
+        max_messages=DEFAULT_EXTRACTION_BATCH_MAX_MESSAGES,
+    )
+    assert resolve_extraction_batch_limits({}) == limits
+    assert limits.enabled is True
+
+
+def test_default_limits_keep_small_sessions_in_one_batch():
+    messages = [_message(f"m{index}") for index in range(32)]
+
+    batches = plan_extraction_batches(messages, resolve_extraction_batch_limits(None))
+
+    assert len(batches) == 1
+    assert [message.id for message in batches[0].messages] == [f"m{index}" for index in range(32)]
+    assert batches[0].oversized is False
+
+
+def test_default_limits_split_oversized_session_by_message_count():
+    messages = [_message(f"m{index}") for index in range(600)]
+
+    batches = plan_extraction_batches(messages, resolve_extraction_batch_limits(None))
+
+    assert len(batches) == 3
+    assert [len(batch.messages) for batch in batches] == [250, 250, 100]
+    assert all(batch.oversized is False for batch in batches)
+
+
+def test_default_limits_split_oversized_session_by_token_count():
+    # ~9000 tokens per message: three of them already exceed the 30k default.
+    messages = [_message(f"m{index}", text="字" * 6000) for index in range(6)]
+
+    batches = plan_extraction_batches(messages, resolve_extraction_batch_limits(None))
+
+    assert len(batches) > 1
+    assert all(
+        batch.estimated_tokens <= DEFAULT_EXTRACTION_BATCH_MAX_MESSAGE_TOKENS
+        for batch in batches
+    )
 
 
 def test_phase2_batches_split_an_oversized_batch_by_message_count():
@@ -213,3 +264,37 @@ async def test_long_term_memory_batches_follow_the_planned_limit():
         ["u3"],
     ]
     assert all(step == "long_term" for _, step, _ in recorded_batches)
+
+
+@pytest.mark.asyncio
+async def test_long_term_memory_extraction_chunks_by_default_without_policy():
+    """#5894: an oversized session commits chunked even without a policy.
+
+    600 messages exceed the default 250-message batch cap, so the extractor
+    runs once per chunk and merges the per-chunk results instead of feeding
+    the whole conversation to a single ExtractLoop pass.
+    """
+    session = Session(viking_fs=None)
+    messages = [_message(f"m{index}") for index in range(600)]
+    extracted_batches = []
+
+    async def extract(batch):
+        extracted_batches.append([message.id for message in batch])
+        return [f"memory-from-{batch[0].id}"]
+
+    async def record(operation_name, step, batch, fn):
+        return await fn()
+
+    result = await session._extract_long_term_memories_with_batching(
+        messages=messages,
+        limits=resolve_extraction_batch_limits(None),
+        archive_uri="viking://user/default/sessions/s1/history/archive_001",
+        extract_batch=extract,
+        record_batch=record,
+    )
+
+    assert len(extracted_batches) == 3
+    assert all(len(batch) <= DEFAULT_EXTRACTION_BATCH_MAX_MESSAGES for batch in extracted_batches)
+    assert extracted_batches[0][0] == "m0"
+    assert extracted_batches[-1][-1] == "m599"
+    assert result == [f"memory-from-m{index}" for index in (0, 250, 500)]

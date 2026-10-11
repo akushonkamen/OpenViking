@@ -29,9 +29,32 @@ class ExtractionMessageBatch:
     oversized: bool = False
 
 
+# Defaults used when a session has no explicit auto-commit policy. Without them
+# the whole archived session ran through ONE ExtractLoop pass and the model had
+# to emit a single operations program covering the entire conversation; on
+# large sessions (several hundred messages) that program drifts out of the DSL
+# and the pass fails with failure_kind=parse_error, while the same content
+# split at message boundaries extracts successfully per chunk. The token budget
+# keeps each pass well inside typical VLM context windows with room for the
+# operations program and tool turns; the message cap bounds short-message
+# sessions. An explicit auto_commit_policy still wins when present.
+DEFAULT_EXTRACTION_BATCH_MAX_MESSAGE_TOKENS = 30000
+DEFAULT_EXTRACTION_BATCH_MAX_MESSAGES = 250
+
+_DEFAULT_LIMITS = ExtractionBatchLimits(
+    max_message_tokens=DEFAULT_EXTRACTION_BATCH_MAX_MESSAGE_TOKENS,
+    max_messages=DEFAULT_EXTRACTION_BATCH_MAX_MESSAGES,
+)
+
+
 def resolve_extraction_batch_limits(auto_commit_policy: Any) -> ExtractionBatchLimits:
+    """Resolve the Phase 2 extraction batch limits for a session.
+
+    Sessions without an explicit policy get the conservative defaults above so
+    oversized commits are chunked instead of failing a single oversized pass.
+    """
     if not isinstance(auto_commit_policy, dict) or not auto_commit_policy:
-        return ExtractionBatchLimits()
+        return _DEFAULT_LIMITS
     policy = AutoCommitPolicy.from_dict(auto_commit_policy)
     return ExtractionBatchLimits(
         max_message_tokens=(
@@ -153,6 +176,8 @@ def plan_extraction_batches(
 
 
 __all__ = [
+    "DEFAULT_EXTRACTION_BATCH_MAX_MESSAGES",
+    "DEFAULT_EXTRACTION_BATCH_MAX_MESSAGE_TOKENS",
     "ExtractionBatchLimits",
     "ExtractionMessageBatch",
     "estimate_extraction_message_tokens",

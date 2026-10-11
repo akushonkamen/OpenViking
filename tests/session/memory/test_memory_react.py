@@ -1077,3 +1077,199 @@ class TestExtractLoopFinalJsonRetry:
         assert extract_loop._add_refetch_results_to_messages.await_count == 1
         assert tracer_error.call_count == 0
         assert logger_warning.call_count == 0
+
+
+class TestFormatRetryBudget:
+    """#5894: the format-retry budget widens for oversized contexts, capped."""
+
+    @staticmethod
+    def _extract_context(estimated_tokens=0):
+        messages = (
+            [SimpleNamespace(estimated_tokens=estimated_tokens)] if estimated_tokens else []
+        )
+        return SimpleNamespace(messages=messages, page_id_map=PageIdMap())
+
+    @staticmethod
+    def _json_config():
+        return SimpleNamespace(
+            memory=SimpleNamespace(link_enabled=False, extraction_output_format="json")
+        )
+
+    @staticmethod
+    def _json_context_provider(extract_context):
+        class FakeContextProvider:
+            read_file_contents = {}
+
+            def get_memory_schemas(self, ctx):
+                return [
+                    MemoryTypeSchema(
+                        memory_type="preferences",
+                        description="Preferences",
+                        directory="viking://user/{user_space}/memories/preferences",
+                        filename_template="{topic}.md",
+                        fields=[],
+                    )
+                ]
+
+            def get_tools(self):
+                return []
+
+            def get_extract_context(self):
+                return extract_context
+
+            def get_output_language(self):
+                return "en"
+
+            def instruction(self):
+                return "Extract memory operations."
+
+            async def prefetch(self):
+                return []
+
+        return FakeContextProvider()
+
+    @staticmethod
+    def _stub_success_path(extract_loop):
+        resolved = ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[])
+        extract_loop.resolve_operations = AsyncMock(return_value=(resolved, []))
+        extract_loop._check_unread_existing_files = AsyncMock(return_value={})
+        extract_loop._validate_patch_operations = AsyncMock(return_value=[])
+        extract_loop.finalize_operations = AsyncMock()
+
+    @pytest.mark.asyncio
+    async def test_small_context_keeps_single_format_retry(self):
+        """Small sessions keep the historical behavior: exactly one repair."""
+
+        class FakeVLM:
+            model = "test-model"
+
+            def __init__(self):
+                self.call_count = 0
+
+            async def get_completion_async(self, **kwargs):
+                self.call_count += 1
+                return "this is not json"
+
+        vlm = FakeVLM()
+        extract_loop = ExtractLoop(
+            vlm=vlm,
+            viking_fs=MagicMock(),
+            context_provider=self._json_context_provider(self._extract_context(0)),
+            max_iterations=1,
+        )
+
+        with patch(
+            "openviking.session.memory.extract_loop.get_openviking_config",
+            return_value=self._json_config(),
+        ):
+            with pytest.raises(RuntimeError, match="after 2 iterations"):
+                await extract_loop.run()
+
+        assert vlm.call_count == 2
+        assert extract_loop._format_retry_budget == 1
+
+    @pytest.mark.asyncio
+    async def test_oversized_context_gets_second_retry_then_raises(self):
+        """Oversized contexts get one extra repair attempt, then stop for good."""
+
+        class FakeVLM:
+            model = "test-model"
+
+            def __init__(self):
+                self.call_count = 0
+
+            async def get_completion_async(self, **kwargs):
+                self.call_count += 1
+                return "this is not json"
+
+        vlm = FakeVLM()
+        extract_loop = ExtractLoop(
+            vlm=vlm,
+            viking_fs=MagicMock(),
+            context_provider=self._json_context_provider(self._extract_context(25000)),
+            max_iterations=1,
+        )
+
+        with patch(
+            "openviking.session.memory.extract_loop.get_openviking_config",
+            return_value=self._json_config(),
+        ):
+            with pytest.raises(RuntimeError, match="after 3 iterations"):
+                await extract_loop.run()
+
+        assert vlm.call_count == 3
+        assert extract_loop._format_retry_budget == 2
+
+    @pytest.mark.asyncio
+    async def test_oversized_context_recovers_on_third_attempt(self):
+        """The extra repair attempt lets a late valid response still succeed."""
+
+        class FakeVLM:
+            model = "test-model"
+
+            def __init__(self):
+                self.responses = iter(
+                    ["this is not json", "still not json", '{"preferences": [], "delete_ids": []}']
+                )
+
+            async def get_completion_async(self, **kwargs):
+                return next(self.responses)
+
+        vlm = FakeVLM()
+        extract_loop = ExtractLoop(
+            vlm=vlm,
+            viking_fs=MagicMock(),
+            context_provider=self._json_context_provider(self._extract_context(25000)),
+            max_iterations=1,
+        )
+        self._stub_success_path(extract_loop)
+
+        with patch(
+            "openviking.session.memory.extract_loop.get_openviking_config",
+            return_value=self._json_config(),
+        ):
+            operations, _ = await extract_loop.run()
+
+        assert operations is not None
+        assert extract_loop.finalize_operations.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_explicit_budget_overrides_auto_resolution_and_clamps(self):
+        """Explicit budgets win over the size heuristic and are clamped to 2."""
+
+        class FakeVLM:
+            model = "test-model"
+
+            def __init__(self):
+                self.call_count = 0
+
+            async def get_completion_async(self, **kwargs):
+                self.call_count += 1
+                return "this is not json"
+
+        vlm = FakeVLM()
+        extract_loop = ExtractLoop(
+            vlm=vlm,
+            viking_fs=MagicMock(),
+            context_provider=self._json_context_provider(self._extract_context(25000)),
+            max_iterations=1,
+            format_retry_budget=1,
+        )
+
+        with patch(
+            "openviking.session.memory.extract_loop.get_openviking_config",
+            return_value=self._json_config(),
+        ):
+            with pytest.raises(RuntimeError, match="after 2 iterations"):
+                await extract_loop.run()
+
+        assert vlm.call_count == 2
+
+        clamped = ExtractLoop(
+            vlm=MagicMock(model="test-model"),
+            viking_fs=MagicMock(),
+            context_provider=self._json_context_provider(self._extract_context(25000)),
+            max_iterations=1,
+            format_retry_budget=99,
+        )
+        assert clamped._format_retry_budget == 2

@@ -57,6 +57,14 @@ logger = get_logger(__name__)
 # must set `vlm.max_tokens` in ov.conf to their own limit to override this default.
 _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS = 32768
 
+# A context near the extraction batch budget asks the model for a long
+# operations program, where one repair round trip is often not enough to pull a
+# drifted program back into the protocol. Above this threshold the format-retry
+# budget widens to _MAX_FORMAT_RETRY_BUDGET; it stays capped so a persistently
+# failing response cannot extend the loop indefinitely.
+_AUTO_FORMAT_RETRY_TOKEN_THRESHOLD = 20000
+_MAX_FORMAT_RETRY_BUDGET = 2
+
 
 @dataclass
 class _EventRepairOperations:
@@ -136,6 +144,7 @@ class ExtractLoop:
         isolation_handler: MemoryIsolationHandler = None,
         thinking: bool = False,
         max_output_tokens: Optional[int] = None,
+        format_retry_budget: Optional[int] = None,
     ):
         """
         Initialize the ExtractLoop.
@@ -152,6 +161,10 @@ class ExtractLoop:
                 configured vlm.max_tokens is used, falling back to a value large enough for
                 full memory rewrites so providers do not apply a small server-side default
                 (e.g. Ark's 4096) and truncate the program mid-string.
+            format_retry_budget: How many format-repair round trips a response may use.
+                None resolves automatically in run(): 1 for typical context sizes, capped
+                at _MAX_FORMAT_RETRY_BUDGET for oversized contexts. Explicit values are
+                clamped to [1, _MAX_FORMAT_RETRY_BUDGET].
         """
         self.vlm = vlm
         self.viking_fs = viking_fs or get_viking_fs()
@@ -161,6 +174,11 @@ class ExtractLoop:
         self.context_provider = context_provider
         self.thinking = bool(thinking)
         self.max_output_tokens = max_output_tokens
+        if format_retry_budget is None:
+            # Resolved in run() once the extract context size is known.
+            self._format_retry_budget: Optional[int] = None
+        else:
+            self._format_retry_budget = max(1, min(int(format_retry_budget), _MAX_FORMAT_RETRY_BUDGET))
         # Resolved in run() via _resolve_effective_max_output_tokens(); default to
         # the extraction floor so a direct _call_llm() before run() stays safe.
         self._effective_max_output_tokens = (
@@ -170,7 +188,8 @@ class ExtractLoop:
         )
         # Use provided isolation_handler or create one in run()
         self._isolation_handler = isolation_handler
-        # Track format error retry (max 1 retry)
+        # Track format error retries against _format_retry_budget (resolved in
+        # run(); default 1 for typical context sizes, 2 for oversized ones).
         self._format_retry_count = 0
         self._last_llm_failure_kind: Optional[str] = None
         self._last_llm_failure_content: str = ""
@@ -242,6 +261,9 @@ class ExtractLoop:
         self._extract_context = self.context_provider.get_extract_context()
         if self._extract_context is None:
             raise ValueError("Failed to get ExtractContext from provider")
+
+        if self._format_retry_budget is None:
+            self._format_retry_budget = self._auto_format_retry_budget()
 
         # 预计算 operations_model
         role_scope = self._isolation_handler.get_read_scope() if self._isolation_handler else None
@@ -402,9 +424,10 @@ class ExtractLoop:
             failure_kind = self._last_llm_failure_kind or "unknown"
             failure_preview = _preview_text(self._last_llm_failure_content)
             parse_error = self._last_parse_error
-            # Add format error message if parse failed (max 1 retry). This may raise
-            # max_iterations, granting one more attempt after this failure.
-            if self._format_retry_count == 0:
+            # Add format error message if the retry budget allows another repair
+            # attempt (1 round trip by default, 2 for oversized contexts). This
+            # may raise max_iterations, granting one more attempt per retry.
+            if self._format_retry_count < (self._format_retry_budget or 1):
                 self._format_retry_count += 1
                 max_iterations += 1
                 retry_reason = "refusal_text" if failure_kind == "refusal_text" else "format_retry"
@@ -480,6 +503,24 @@ class ExtractLoop:
         self._effective_max_output_tokens = (
             configured if configured is not None else _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS
         )
+
+    def _auto_format_retry_budget(self) -> int:
+        """Resolve the format-retry budget from the extract context size.
+
+        Long contexts demand long operations programs, where a single repair
+        round trip rarely recovers a drifted program. Oversized contexts get one
+        extra repair attempt; everything else keeps the historical single retry.
+        """
+        try:
+            estimated_tokens = sum(
+                int(getattr(message, "estimated_tokens", 0) or 0)
+                for message in (self._extract_context.messages or [])
+            )
+        except Exception:
+            return 1
+        if estimated_tokens > _AUTO_FORMAT_RETRY_TOKEN_THRESHOLD:
+            return _MAX_FORMAT_RETRY_BUDGET
+        return 1
 
     def _retryable_resolution_issues(self, operations: ResolvedOperations) -> List[Dict[str, Any]]:
         issues: List[Dict[str, Any]] = []
