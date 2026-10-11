@@ -97,13 +97,17 @@ class StorageConfig(BaseModel):
                 "'session_commit' queue."
             )
 
-        if self.agfs.path is not None:
+        # `resolve_paths` itself assigns `agfs.path`/`vectordb.path` from `workspace`
+        # below, so on any re-validation these fields equal `workspace`. Only warn when
+        # the user actually configured a path different from `workspace`, otherwise the
+        # deprecation warning would be self-generated and impossible to silence.
+        if self.agfs.path is not None and self.agfs.path != self.workspace:
             logger.warning(
                 f"StorageConfig: 'agfs.path' is deprecated and will be ignored. "
                 f"Using '{self.workspace}' from workspace instead of '{self.agfs.path}'"
             )
 
-        if self.vectordb.path is not None:
+        if self.vectordb.path is not None and self.vectordb.path != self.workspace:
             logger.warning(
                 f"StorageConfig: 'vectordb.path' is deprecated and will be ignored. "
                 f"Using '{self.workspace}' from workspace instead of '{self.vectordb.path}'"
