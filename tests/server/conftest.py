@@ -73,12 +73,17 @@ def _install_fake_embedder(monkeypatch):
 def _install_fake_vlm(monkeypatch):
     """Use a fake VLM so server tests never hit external LLM APIs."""
 
-    async def _fake_get_completion(self, prompt, thinking=False):
+    async def _fake_get_completion(self, prompt, thinking=False, **kwargs):
+        # ExtractLoop calls get_completion_async(messages=..., tools=...,
+        # tool_choice=..., max_tokens=...); absorb those so Phase 2 memory
+        # extraction reaches a terminal state instead of raising TypeError
+        # mid-call and leaving the commit racing the test.
         if "extract user-private configuration items" in prompt:
             return '{"values": {"api_key": "secret-xyz", "base_url": "https://example.com"}}'
         return "# Test Summary\n\nFake summary for testing.\n\n## Details\nTest content."
 
-    async def _fake_get_vision_completion(self, prompt, images, thinking=False):
+    async def _fake_get_vision_completion(self, *args, **kwargs):
+        # Callers pass keyword-only payloads (e.g. messages=...); accept any.
         return "Fake image description for testing."
 
     monkeypatch.setattr(VLMConfig, "is_available", lambda self: True)

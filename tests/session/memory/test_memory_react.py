@@ -1084,9 +1084,7 @@ class TestFormatRetryBudget:
 
     @staticmethod
     def _extract_context(estimated_tokens=0):
-        messages = (
-            [SimpleNamespace(estimated_tokens=estimated_tokens)] if estimated_tokens else []
-        )
+        messages = [SimpleNamespace(estimated_tokens=estimated_tokens)] if estimated_tokens else []
         return SimpleNamespace(messages=messages, page_id_map=PageIdMap())
 
     @staticmethod

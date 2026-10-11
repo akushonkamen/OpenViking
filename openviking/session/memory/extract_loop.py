@@ -178,7 +178,9 @@ class ExtractLoop:
             # Resolved in run() once the extract context size is known.
             self._format_retry_budget: Optional[int] = None
         else:
-            self._format_retry_budget = max(1, min(int(format_retry_budget), _MAX_FORMAT_RETRY_BUDGET))
+            self._format_retry_budget = max(
+                1, min(int(format_retry_budget), _MAX_FORMAT_RETRY_BUDGET)
+            )
         # Resolved in run() via _resolve_effective_max_output_tokens(); default to
         # the extraction floor so a direct _call_llm() before run() stays safe.
         self._effective_max_output_tokens = (

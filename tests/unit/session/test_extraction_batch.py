@@ -78,8 +78,7 @@ def test_default_limits_split_oversized_session_by_token_count():
 
     assert len(batches) > 1
     assert all(
-        batch.estimated_tokens <= DEFAULT_EXTRACTION_BATCH_MAX_MESSAGE_TOKENS
-        for batch in batches
+        batch.estimated_tokens <= DEFAULT_EXTRACTION_BATCH_MAX_MESSAGE_TOKENS for batch in batches
     )
 
 
