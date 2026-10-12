@@ -24,9 +24,11 @@ from openviking.server.dependencies import set_service
 from openviking.server.identity import AuthMode, RequestContext, Role
 from openviking.server.mcp_endpoint import (
     StoreMessage,
+    _client_request_method_literals,
     _get_ctx,
     _IdentityASGIMiddleware,
     _mcp_ctx,
+    _MethodPrecheckASGIMiddleware,
     _resolve_mcp_workspace_uri,
     add_resource,
     add_skill,
@@ -890,6 +892,189 @@ async def test_mcp_middleware_rejects_invalid_actor_peer_header():
 
     assert response.status_code == 400
     assert "path separators" in response.text
+
+
+# ---------------------------------------------------------------------------
+# _MethodPrecheckASGIMiddleware (unknown-method -32601 shim)
+# ---------------------------------------------------------------------------
+
+
+def _precheck_app(downstream, **middleware_kwargs):
+    """Mount the method pre-check middleware over a raw downstream ASGI app."""
+    app = FastAPI()
+    app.routes.append(
+        Route(
+            "/mcp",
+            endpoint=_MethodPrecheckASGIMiddleware(downstream, **middleware_kwargs),
+            methods=["GET", "POST", "DELETE"],
+        )
+    )
+    return app
+
+
+def _recording_downstream(calls: list[bytes]):
+    async def downstream(scope, receive, send):
+        from starlette.requests import Request
+
+        body = await Request(scope, receive).body()
+        calls.append(body)
+        response = httpx.Response(200, json={"jsonrpc": "2.0", "id": None, "result": {}})
+        await send(
+            {
+                "type": "http.response.start",
+                "status": response.status_code,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": response.content})
+
+    return downstream
+
+
+@pytest.mark.parametrize("method", ["server/discover", "totally/unknown"])
+async def test_precheck_answers_32601_for_unknown_method(method):
+    """Unknown methods get the spec-compliant METHOD_NOT_FOUND, not -32602 (#5841)."""
+
+    async def downstream(scope, receive, send):
+        raise AssertionError("unknown method should not reach the SDK")
+
+    app = _precheck_app(downstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ov.test") as client:
+        response = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 7, "method": method, "params": {}},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == 7
+    assert payload["error"]["code"] == -32601
+    assert payload["error"]["message"] == "Method not found"
+
+
+async def test_precheck_passes_known_method_through_with_intact_body():
+    import json as _json
+
+    calls: list[bytes] = []
+    app = _precheck_app(_recording_downstream(calls))
+    transport = httpx.ASGITransport(app=app)
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    async with httpx.AsyncClient(transport=transport, base_url="http://ov.test") as client:
+        response = await client.post("/mcp", json=body)
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert _json.loads(calls[0]) == body
+
+
+async def test_precheck_keeps_param_error_path_for_known_method():
+    """A known method with bad params still reaches the SDK (which answers -32602)."""
+    calls: list[bytes] = []
+    app = _precheck_app(_recording_downstream(calls))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ov.test") as client:
+        response = await client.post(
+            "/mcp",
+            content=b'{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "bogus": 1}',
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"jsonrpc": "2.0", "method": "notifications/unknown"}',  # notification: no id
+        b"not-json-at-all",  # parse error: SDK answers -32700 itself
+        b'["still", "batch"]',  # batch payload: SDK owns that behavior
+        b'{"id": 1}',  # no method
+    ],
+)
+async def test_precheck_passes_non_request_bodies_through(body):
+    calls: list[bytes] = []
+    app = _precheck_app(_recording_downstream(calls))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ov.test") as client:
+        await client.post("/mcp", content=body, headers={"content-type": "application/json"})
+
+    assert len(calls) == 1
+    assert calls[0] == body
+
+
+async def test_precheck_passes_unknown_method_through_when_json_not_accepted():
+    """A client that cannot accept application/json keeps the SDK's own behavior."""
+    calls: list[bytes] = []
+    app = _precheck_app(_recording_downstream(calls))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ov.test") as client:
+        await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {}},
+            headers={"Accept": "text/event-stream"},
+        )
+
+    assert len(calls) == 1
+
+
+async def test_precheck_passes_get_through_without_consuming_body():
+    async def downstream(scope, receive, send):
+        response = httpx.Response(200, json={"ok": True})
+        await send(
+            {
+                "type": "http.response.start",
+                "status": response.status_code,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": response.content})
+
+    app = _precheck_app(downstream)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ov.test") as client:
+        response = await client.get("/mcp")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+async def test_precheck_fails_open_when_method_set_is_empty():
+    """Passive mode (empty known set): unknown methods are not intercepted."""
+
+    async def downstream(scope, receive, send):
+        response = httpx.Response(200, json={"reached": True})
+        await send(
+            {
+                "type": "http.response.start",
+                "status": response.status_code,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": response.content})
+
+    app = _precheck_app(downstream, known_methods=frozenset())
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ov.test") as client:
+        response = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {}},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"reached": True}
+
+
+def test_client_request_method_literals_tracks_sdk_union():
+    """The known set is derived from the installed SDK, not a hand-maintained list."""
+    known = _client_request_method_literals()
+
+    assert known is not None
+    # Core routing methods of any MCP version.
+    assert {"ping", "initialize", "tools/list", "tools/call"} <= known
+    # The 2026-07-28-era probe is NOT in the pinned SDK's union — that's the bug.
+    assert "server/discover" not in known
 
 
 # ---------------------------------------------------------------------------
