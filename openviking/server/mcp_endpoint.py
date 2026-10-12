@@ -47,7 +47,7 @@ from mcp.types import (
     TextContent,
     ToolAnnotations,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -291,11 +291,17 @@ def _client_request_method_literals() -> frozenset[str] | None:
     return frozenset(methods) or None
 
 
-def _parse_jsonrpc_request(body: bytes) -> dict[str, Any] | None:
-    """Parse a single JSON-RPC request object from an HTTP body, else ``None``.
+def _parse_jsonrpc_request(body: bytes) -> mcp_types.JSONRPCRequest | None:
+    """Parse a single JSON-RPC *request* using the SDK's own envelope model.
 
-    Batch payloads (lists), non-JSON bodies and objects without a string
-    ``method`` return ``None`` so the SDK keeps answering them unchanged.
+    The middleware may only intercept messages the SDK transport itself accepts,
+    so envelope validation is delegated to ``mcp.types.JSONRPCMessage`` — the
+    exact model ``StreamableHTTPServerTransport._handle_post_request`` validates
+    the parsed body against. Batches (lists), non-JSON bodies, envelopes the SDK
+    rejects (wrong or missing ``jsonrpc``, non-object ``params``, ...) and
+    non-requests (notifications, responses) all return ``None``, leaving the SDK
+    to answer them exactly as before (-32700 parse error, 400 INVALID_PARAMS, or
+    202 respectively).
     """
     try:
         payload = json.loads(body)
@@ -303,9 +309,27 @@ def _parse_jsonrpc_request(body: bytes) -> dict[str, Any] | None:
         return None
     if not isinstance(payload, dict):
         return None
-    if not isinstance(payload.get("method"), str) or not payload.get("method"):
+    try:
+        message = mcp_types.JSONRPCMessage.model_validate(payload)
+    except ValidationError:
         return None
-    return payload
+    request = message.root
+    return request if isinstance(request, mcp_types.JSONRPCRequest) else None
+
+
+def _supported_protocol_versions() -> frozenset[str] | None:
+    """The ``MCP-Protocol-Version`` header values the installed SDK accepts.
+
+    Mirrors ``StreamableHTTPServerTransport._validate_protocol_version``, which
+    answers 400 for any other value. ``None`` when the SDK does not expose the
+    set, in which case a request carrying the header must not be intercepted at
+    all (its version may be one the SDK would reject).
+    """
+    try:
+        from mcp.shared.version import SUPPORTED_PROTOCOL_VERSIONS
+    except Exception:  # pragma: no cover - SDK always ships this module
+        return None
+    return frozenset(SUPPORTED_PROTOCOL_VERSIONS)
 
 
 def _replay_receive(buffered: list[dict], receive: Receive) -> Receive:
@@ -320,17 +344,6 @@ def _replay_receive(buffered: list[dict], receive: Receive) -> Receive:
     return replay
 
 
-def _accepts_json(accept: str) -> bool:
-    """True unless every listed media type would reject an application/json body."""
-    if not accept.strip():
-        return True  # absent Accept header: RFC 9110 treats it as */*
-    for part in accept.split(","):
-        media = part.split(";")[0].strip().lower()
-        if media in ("application/json", "application/*", "*/*"):
-            return True
-    return False
-
-
 class _MethodPrecheckASGIMiddleware:
     """Answer ``-32601 Method not found`` for JSON-RPC methods the SDK cannot route.
 
@@ -342,12 +355,26 @@ class _MethodPrecheckASGIMiddleware:
     as a fixable-parameter error rather than the definitive legacy-fallback
     signal, so they keep re-probing before falling back.
 
-    This middleware resolves the method *before* the request enters the SDK,
-    with the known set derived from the installed SDK (see
-    ``_client_request_method_literals``). Bodies that are not single JSON-RPC
-    request objects, notifications (no ``id``), known methods and non-POST
-    requests are passed through untouched. This is a compatibility shim; the
-    proper fix is upstream.
+    The middleware intercepts only when the SDK transport itself would have
+    accepted the request, so the shim changes *only* the unsupported-method error:
+
+    - **Envelope**: the body must validate as a single ``JSONRPCRequest`` under
+      ``mcp.types.JSONRPCMessage`` — the SDK transport's own validation. Anything
+      else (parse errors, wrong ``jsonrpc``, non-object ``params``, batches,
+      notifications, responses) keeps the SDK's existing answer.
+    - **Transport gates** (mirroring ``_handle_post_request`` in
+      ``mcp/server/streamable_http.py``): ``Content-Type`` must be
+      ``application/json`` (else the SDK's transport security answers 400), and
+      ``Accept`` must include both ``application/json`` and
+      ``text/event-stream`` (else 406 in the SDK's default SSE response mode;
+      requiring both is the intersection that passes in JSON mode too), and a
+      present ``MCP-Protocol-Version`` header must be one the SDK supports
+      (else 400). Any doubt passes through.
+    - **Known methods**: derived at init from the installed SDK (see
+      ``_client_request_method_literals``) and never intercepted; a known method
+      with bad params still gets the SDK's -32602.
+
+    This is a compatibility shim; the proper fix is upstream.
     """
 
     def __init__(self, app: ASGIApp, known_methods: frozenset[str] | None = None):
@@ -355,6 +382,45 @@ class _MethodPrecheckASGIMiddleware:
         self.known_methods = (
             known_methods if known_methods is not None else _client_request_method_literals()
         )
+        self._supported_protocol_versions = _supported_protocol_versions()
+
+    def _passes_transport_validation(self, scope: Scope) -> bool:
+        """Mirror the SDK transport's HTTP-layer gates; ``False`` = pass through.
+
+        Only requests that pass every gate here can be intercepted, so a request
+        the SDK would answer 406 / 415 / 400 keeps that transport-level error
+        instead of getting a spurious -32601.
+        """
+        headers = {
+            k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers") or []
+        }
+
+        # Content-Type must be application/json (the SDK transport security
+        # answers 400 for POSTs, and the transport itself 415).
+        content_type = headers.get("content-type", "")
+        media_types = [part.strip() for part in content_type.split(";")[0].split(",")]
+        if not any(part == "application/json" for part in media_types):
+            return False
+
+        # Accept must include both required media types (SDK: 406 Not Acceptable
+        # in the default SSE response mode; JSON response mode only requires
+        # application/json, so this is the conservative intersection).
+        accept_types = [part.strip() for part in headers.get("accept", "").split(",")]
+        has_json = any(part.startswith("application/json") for part in accept_types)
+        has_sse = any(part.startswith("text/event-stream") for part in accept_types)
+        if not (has_json and has_sse):
+            return False
+
+        # A present MCP-Protocol-Version header must be supported (SDK: 400 Bad
+        # Request). Initialize requests are exempt upstream, but initialize is a
+        # known method and never intercepted.
+        version = headers.get("mcp-protocol-version")
+        if version is not None:
+            supported = self._supported_protocol_versions
+            if supported is None or version not in supported:
+                return False
+
+        return True
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
         if scope["type"] != "http" or scope.get("method") != "POST" or not self.known_methods:
@@ -373,23 +439,20 @@ class _MethodPrecheckASGIMiddleware:
             if not message.get("more_body", False):
                 break
 
-        payload = _parse_jsonrpc_request(body)
-        if payload is None or payload["method"] in self.known_methods or "id" not in payload:
-            # Unparseable / known / notification: let the SDK answer as before.
+        request = _parse_jsonrpc_request(body)
+        if request is None or request.method in self.known_methods:
+            # Not a single valid request envelope, or a known method: let the
+            # SDK answer as before (parse error, -32602, 202, or routing).
             return await self.app(scope, _replay_receive(buffered, receive), send)
-
-        accept = ""
-        for key, value in scope.get("headers") or []:
-            if key == b"accept":
-                accept = value.decode("latin-1").lower()
-                break
-        if not _accepts_json(accept):
+        if not self._passes_transport_validation(scope):
+            # The SDK transport rejects this request on HTTP semantics (406/400);
+            # it must keep answering, never the -32601 shim.
             return await self.app(scope, _replay_receive(buffered, receive), send)
 
         response = JSONResponse(
             {
                 "jsonrpc": "2.0",
-                "id": payload.get("id"),
+                "id": request.id,
                 "error": {"code": -32601, "message": "Method not found", "data": ""},
             }
         )
