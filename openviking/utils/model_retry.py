@@ -157,6 +157,11 @@ TRANSIENT_API_ERROR_PATTERNS = (
     # without this pattern the error classifies as unknown and is never
     # retried (#5513).
     "timed out",
+    # Provider overload responses (e.g. an in-stream error event surfaced by
+    # the openai-codex backend as a status-less `openai.APIError`) carry no
+    # status code, so without this pattern the error classifies as unknown
+    # and is never retried (#6000).
+    "overloaded",
     "connectionerror",
     "connection refused",
     "connection reset",
