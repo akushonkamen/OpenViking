@@ -179,31 +179,34 @@ export class OpenVikingRuntime {
   }
 
   maybeCommit(session, event) {
-    if (event.type !== "turn/end") return;
+    // DSH appends compaction/start before it summarizes and rewrites history,
+    // so commit there regardless of the threshold, like PreCompact elsewhere.
+    const boundary = event.type === "compaction/start";
+    if (event.type !== "turn/end" && !boundary) return;
     const state = this.stateFor(session);
     if (!isCaptureEnabled(state.config)) return;
     this.enqueueWrite(state, async () => {
       if (state.hasPendingWrites) return;
       if (!state.ready && !(await this.ensureState(state)).ready) return;
-      const metadata = await this.client.getSession(
-        state.ovSessionId,
-        state.config.peerId,
-      );
-      if (Number(metadata?.pending_tokens || 0) < state.config.commitTokenThreshold) return;
+      if (!boundary) {
+        const metadata = await this.client.getSession(
+          state.ovSessionId,
+          state.config.peerId,
+        );
+        if (Number(metadata?.pending_tokens || 0) < state.config.commitTokenThreshold) return;
+      }
       const response = await this.client.commitSession(
         state.ovSessionId,
         state.config.peerId,
       );
-      this.log("commit", {
+      this.log(boundary ? "compaction_commit" : "commit", {
         sessionId: state.ovSessionId,
         ok: response.ok,
         trace_id: response.result?.trace_id || response.traceId,
         error: response.ok ? undefined : response.error?.message || response.error?.code,
       });
       if (isRetryableFailure(response)) {
-        await this.enqueueFinalCommit(state, {
-          keep_recent_count: state.config.commitKeepRecentCount,
-        });
+        await this.enqueueFinalCommit(state, { keep_recent_count: 0 });
       }
     });
   }
@@ -215,9 +218,7 @@ export class OpenVikingRuntime {
     state.disposing = (async () => {
       this.enqueueWrite(state, async () => {
         if (!isCaptureEnabled(state.config)) return;
-        const commitPayload = {
-          keep_recent_count: state.config.commitKeepRecentCount,
-        };
+        const commitPayload = { keep_recent_count: 0 };
         if (state.hasPendingWrites) {
           await this.enqueueFinalCommit(state, commitPayload);
           return;

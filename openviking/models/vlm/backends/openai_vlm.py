@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from openviking.models.model_error import model_error_boundary
 from openviking.models.network import (
     create_optional_async_httpx_client,
     create_optional_sync_httpx_client,
@@ -26,8 +27,6 @@ try:
     import openai
 except ImportError:
     openai = None
-
-from openviking.utils.model_retry import retry_async, retry_sync
 
 from ..base import ToolCall, VLMBase, VLMResponse
 from ..registry import DEFAULT_AZURE_API_VERSION
@@ -67,7 +66,7 @@ def _build_openai_client_kwargs(
     else:
         kwargs = {"api_key": api_key, "base_url": api_base}
     kwargs["timeout"] = timeout
-    # OpenViking owns provider retry/backoff via retry_sync/retry_async.
+    # RetryVLM owns retry/backoff; the SDK performs exactly one request.
     kwargs["max_retries"] = 0
     if extra_headers:
         kwargs["default_headers"] = extra_headers
@@ -258,6 +257,9 @@ class OpenAIVLM(VLMBase):
                     "completion_tokens": response.usage.completion_tokens,
                     "total_tokens": response.usage.total_tokens,
                     "prompt_tokens_details": getattr(response.usage, "prompt_tokens_details", None),
+                    "completion_tokens_details": getattr(
+                        response.usage, "completion_tokens_details", None
+                    ),
                 }
 
             return VLMResponse(
@@ -333,6 +335,7 @@ class OpenAIVLM(VLMBase):
         content = self._extract_content_from_response(response)
         return self._clean_response(content)
 
+    @model_error_boundary
     def get_completion(
         self,
         prompt: str = "",
@@ -355,13 +358,9 @@ class OpenAIVLM(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._extract_completion_content(response, elapsed)
 
-        return retry_sync(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="OpenAI VLM completion",
-        )
+        return _call()
 
+    @model_error_boundary
     async def get_completion_async(
         self,
         prompt: str = "",
@@ -393,12 +392,7 @@ class OpenAIVLM(VLMBase):
             + format_messages(redact_image_data_urls(kwargs.get("messages", [])))
         )
 
-        return await retry_async(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="OpenAI VLM async completion",
-        )
+        return await _call()
 
     def _detect_image_format(self, data: bytes) -> str:
         """Detect image format from magic bytes.
@@ -451,6 +445,7 @@ class OpenAIVLM(VLMBase):
             }
         return {"type": "image_url", "image_url": {"url": image}}
 
+    @model_error_boundary
     def get_vision_completion(
         self,
         prompt: str = "",
@@ -476,13 +471,9 @@ class OpenAIVLM(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._extract_completion_content(response, elapsed)
 
-        return retry_sync(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="OpenAI VLM vision completion",
-        )
+        return _call()
 
+    @model_error_boundary
     async def get_vision_completion_async(
         self,
         prompt: str = "",
@@ -508,9 +499,4 @@ class OpenAIVLM(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return await self._extract_completion_content_async(response, elapsed)
 
-        return await retry_async(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="OpenAI VLM async vision completion",
-        )
+        return await _call()

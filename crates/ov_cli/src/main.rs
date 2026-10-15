@@ -433,14 +433,6 @@ enum Commands {
         /// Wait until processing is complete
         #[arg(long, help_heading = "Common options")]
         wait: bool,
-        /// Request timeout in seconds. Used with --wait and by Manifest private Git imports
-        #[arg(
-            long,
-            value_parser = config::parse_positive_timeout,
-            value_name = "seconds",
-            help_heading = "Common options"
-        )]
-        timeout: Option<f64>,
         /// Enable strict mode for directory scanning (fail if any unsupported files found)
         #[arg(
             long = "strict",
@@ -733,14 +725,6 @@ enum Commands {
         /// Wait until semantic refresh is complete
         #[arg(long, help_heading = "Common options")]
         wait: bool,
-        /// Wait timeout in seconds (only used with --wait)
-        #[arg(
-            long,
-            value_parser = config::parse_positive_timeout,
-            value_name = "seconds",
-            help_heading = "Common options"
-        )]
-        timeout: Option<f64>,
     },
     /// [Data] Copy a file or directory
     Cp {
@@ -785,6 +769,12 @@ enum Commands {
         /// Viking URI
         #[arg(value_name = "uri")]
         uri: String,
+        /// Starting line offset (0-indexed)
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..), help_heading = "Common options")]
+        offset: i64,
+        /// Number of lines to read; -1 reads to the end
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true, value_parser = clap::value_parser!(i64).range(-1..), help_heading = "Common options")]
+        limit: i64,
     },
     /// [Data] Read abstract content (Level 0)
     Abstract {
@@ -841,14 +831,6 @@ enum Commands {
             help_heading = "Advanced options"
         )]
         processing_mode: String,
-        /// Optional wait timeout in seconds
-        #[arg(
-            long,
-            value_parser = config::parse_positive_timeout,
-            value_name = "seconds",
-            help_heading = "Common options"
-        )]
-        timeout: Option<f64>,
         /// Comma-separated k=v retrieval tags to write with the content
         #[arg(long = "tags", value_delimiter = ',')]
         tags: Vec<String>,
@@ -980,7 +962,16 @@ enum Commands {
             help_heading = "Common options"
         )]
         search_type: String,
-        /// Target URI
+        /// Return ranked hits (list) or assembled context (context)
+        #[arg(
+            long,
+            default_value = "list",
+            value_parser = ["list", "context"],
+            value_name = "list|context",
+            help_heading = "Common options"
+        )]
+        mode: String,
+        /// Target URI (list mode only)
         #[arg(
             short,
             long,
@@ -1016,7 +1007,7 @@ enum Commands {
             help_heading = "Advanced options"
         )]
         before: Option<String>,
-        /// Only include results with specific level(s) (0=abstract, 1=overview, 2=file)
+        /// Filter levels (0=abstract, 1=overview, 2=file); ignored in context mode
         #[arg(
             short = 'L',
             long = "level",
@@ -1036,7 +1027,7 @@ enum Commands {
         /// Only include results matching all of these explicit tags
         #[arg(long = "tags", value_delimiter = ',')]
         tags: Option<Vec<String>>,
-        /// Include the full visible content for every matched URI
+        /// Include the full visible content for every matched URI (list mode only)
         #[arg(long, help_heading = "Advanced options")]
         read_content: bool,
         /// Enable event decay with protection duration: 0 (immediate) or Xm/Xh/Xd
@@ -1289,7 +1280,7 @@ enum Commands {
             value_name = "uri"
         )]
         from_uris: Vec<String>,
-        /// Target Wiki directory or skills namespace
+        /// Target resource directory or skills namespace
         #[arg(long, value_name = "uri")]
         to: String,
         /// Skill directory or SKILL.md Viking URI; the literal `memory` runs memory consolidation
@@ -1298,23 +1289,14 @@ enum Commands {
         /// Additional instructions for this Compile task
         #[arg(long, value_name = "text")]
         instruction: Option<String>,
-        /// Provider arguments as a JSON object
+        /// Provider arguments as JSON; VikingBot wiki_links defaults to false
         #[arg(long, value_name = "json")]
         args: Option<String>,
     },
 
     // --- Status & Observability ---
     /// [Status] Wait for queued async processing to complete
-    Wait {
-        /// Wait timeout in seconds
-        #[arg(
-            long,
-            value_parser = config::parse_positive_timeout,
-            value_name = "seconds",
-            help_heading = "Common options"
-        )]
-        timeout: Option<f64>,
-    },
+    Wait,
     /// [Status] Track async resource processing tasks
     Task {
         #[command(subcommand)]
@@ -1563,11 +1545,7 @@ pub(crate) enum SnapshotCmd {
 #[derive(Subcommand)]
 enum SystemCommands {
     /// Wait for queued async processing to complete
-    Wait {
-        /// Wait timeout in seconds
-        #[arg(long, value_parser = config::parse_positive_timeout, value_name = "seconds")]
-        timeout: Option<f64>,
-    },
+    Wait,
     /// Show component status
     Status,
     /// Quick health check
@@ -1582,29 +1560,6 @@ enum SystemCommands {
     Crypto {
         #[command(subcommand)]
         action: commands::crypto::CryptoCommands,
-    },
-    /// Backend sync inspection and repair commands
-    Backend {
-        #[command(subcommand)]
-        action: SystemBackendCommands,
-    },
-}
-
-#[derive(Subcommand)]
-enum SystemBackendCommands {
-    /// Show multi-write backend sync status for a URI subtree
-    #[command(name = "sync-status")]
-    SyncStatus {
-        /// Viking URI to inspect
-        #[arg(value_name = "uri")]
-        uri: String,
-    },
-    /// Retry pending multi-write backend sync work for a URI subtree
-    #[command(name = "sync-retry")]
-    SyncRetry {
-        /// Viking URI to repair
-        #[arg(value_name = "uri")]
-        uri: String,
     },
 }
 
@@ -2538,14 +2493,6 @@ fn plain_help_misuse(args: &[OsString]) -> Option<PlainHelpMisuse> {
         {
             path.push(watch_subcommand.to_string());
         }
-        if command == "system"
-            && path.get(1).is_some_and(|token| token == "backend")
-            && let Some(backend_subcommand) =
-                tokens.get(2).map(|token| canonical_plain_help_token(token))
-            && backend_subcommand != "help"
-        {
-            path.push(backend_subcommand.to_string());
-        }
         return Some(PlainHelpMisuse {
             help_command: prefixed_help_command(&path),
         });
@@ -2757,10 +2704,6 @@ fn known_task_command_requires_config(tokens: &[String]) -> bool {
 fn known_system_command_requires_config(tokens: &[String]) -> bool {
     match tokens.get(1).map(String::as_str) {
         Some("wait" | "status" | "health" | "consistency") => true,
-        Some("backend") => matches!(
-            tokens.get(2).map(String::as_str),
-            None | Some("sync-status" | "sync-retry")
-        ),
         Some("crypto") => matches!(tokens.get(2).map(String::as_str), None | Some("init-key")),
         _ => false,
     }
@@ -3369,7 +3312,6 @@ async fn main() {
             reason,
             instruction,
             wait,
-            timeout,
             tags,
             tag_mode,
             acl,
@@ -3402,7 +3344,6 @@ async fn main() {
                                 processing_mode,
                                 external_connector: run.external_connector,
                             },
-                            timeout,
                             ctx,
                         )
                         .await
@@ -3418,7 +3359,6 @@ async fn main() {
                     reason,
                     instruction,
                     wait,
-                    timeout,
                     strict_mode,
                     ignore_dirs,
                     include,
@@ -3566,9 +3506,9 @@ async fn main() {
             on_conflict,
             vector_mode,
         } => handlers::handle_restore(file_path, on_conflict, vector_mode, ctx).await,
-        Commands::Wait { timeout } => {
+        Commands::Wait => {
             let client = ctx.get_client();
-            commands::system::wait(&client, timeout, ctx.output_format, ctx.compact).await
+            commands::system::wait(&client, ctx.output_format, ctx.compact).await
         }
         Commands::Task { action } => match action {
             TaskCommands::Status { task_id } => {
@@ -3737,8 +3677,7 @@ async fn main() {
             uri,
             recursive,
             wait,
-            timeout,
-        } => handlers::handle_rm(uri, recursive, wait, timeout, ctx).await,
+        } => handlers::handle_rm(uri, recursive, wait, ctx).await,
         Commands::Cp {
             from_uri,
             to_uri,
@@ -3837,7 +3776,9 @@ async fn main() {
             }
             Ok(())
         }
-        Commands::Read { uri } => handlers::handle_read(uri, ctx).await,
+        Commands::Read { uri, offset, limit } => {
+            handlers::handle_read(uri, offset, limit, ctx).await
+        }
         Commands::Abstract { uri } => handlers::handle_abstract(uri, ctx).await,
         Commands::Overview { uri } => handlers::handle_overview(uri, ctx).await,
         Commands::Write {
@@ -3848,7 +3789,6 @@ async fn main() {
             mode,
             wait,
             processing_mode,
-            timeout,
             tags,
             tag_mode,
             acl,
@@ -3866,7 +3806,6 @@ async fn main() {
                 from_file,
                 effective_mode,
                 wait,
-                timeout,
                 processing_mode,
                 tags,
                 tag_mode,
@@ -3928,6 +3867,7 @@ async fn main() {
             query,
             image,
             search_type,
+            mode,
             uri,
             session_id,
             node_limit,
@@ -3945,6 +3885,7 @@ async fn main() {
                 uri,
                 image,
                 search_type,
+                mode,
                 session_id,
                 node_limit,
                 threshold,
@@ -4024,7 +3965,7 @@ mod tests {
     };
     use crate::config::{Config, DEFAULT_CUSTOM_URL};
     use crate::output::OutputFormat;
-    use crate::{AdminCommands, SystemBackendCommands, SystemCommands, handlers};
+    use crate::{AdminCommands, handlers};
     use clap::{CommandFactory, Parser};
     use std::ffi::OsString;
 
@@ -4186,12 +4127,23 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_search_context_type() {
-        let cli = Cli::try_parse_from(["ov", "search", "invoice", "--context-type", "skill"])
-            .expect("search context type should parse");
+    fn cli_parses_search_context_mode_and_type() {
+        let cli = Cli::try_parse_from([
+            "ov",
+            "search",
+            "invoice",
+            "--mode",
+            "context",
+            "--context-type",
+            "skill",
+        ])
+        .expect("search context mode and type should parse");
 
         match cli.command {
-            Commands::Search { context_type, .. } => {
+            Commands::Search {
+                mode, context_type, ..
+            } => {
+                assert_eq!(mode, "context");
                 assert_eq!(context_type, Some(vec!["skill".to_string()]));
             }
             _ => panic!("expected search command"),
@@ -4204,9 +4156,12 @@ mod tests {
             .expect("search image should parse");
 
         match cli.command {
-            Commands::Search { query, image, .. } => {
+            Commands::Search {
+                query, image, mode, ..
+            } => {
                 assert_eq!(query.as_deref(), Some("poster"));
                 assert_eq!(image.as_deref(), Some("viking://x.png"));
+                assert_eq!(mode, "list");
             }
             _ => panic!("expected search command"),
         }
@@ -4322,6 +4277,37 @@ mod tests {
     }
 
     #[test]
+    fn cli_read_line_ranges() {
+        for (args, expected_offset, expected_limit) in [
+            (vec![], 0, -1),
+            (vec!["--offset", "10", "--limit", "5"], 10, 5),
+            (vec!["--offset", "10", "--limit", "-1"], 10, -1),
+            (vec!["--limit", "0"], 0, 0),
+            (vec!["--offset", "10"], 10, -1),
+        ] {
+            let mut argv = vec!["ov", "read", "viking://resources/example.md"];
+            argv.extend(args);
+            let cli = Cli::try_parse_from(argv).expect("valid read range should parse");
+            match cli.command {
+                Commands::Read { offset, limit, .. } => {
+                    assert_eq!((offset, limit), (expected_offset, expected_limit));
+                }
+                _ => panic!("expected read command"),
+            }
+        }
+        for args in [["--offset", "-1"], ["--limit", "-2"], ["--limit", "abc"]] {
+            assert!(
+                Cli::try_parse_from(
+                    ["ov", "read", "viking://resources/example.md"]
+                        .into_iter()
+                        .chain(args)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn cli_compile_memory_mode_parses_without_from() {
         let cli = Cli::try_parse_from([
             "ov",
@@ -4343,22 +4329,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cli_parses_system_backend_sync_status() {
-        let cli = Cli::try_parse_from(["ov", "system", "backend", "sync-status", "viking://a"])
-            .expect("system backend sync-status should parse");
-
-        match cli.command {
-            Commands::System { action } => match action {
-                SystemCommands::Backend { action } => match action {
-                    SystemBackendCommands::SyncStatus { uri } => assert_eq!(uri, "viking://a"),
-                    _ => panic!("expected backend sync-status command"),
-                },
-                _ => panic!("expected system backend command"),
-            },
-            _ => panic!("expected system command"),
-        }
-    }
 
     #[test]
     fn server_commands_require_existing_cli_config() {
@@ -4584,7 +4554,6 @@ mod tests {
             &["ov", "config", "validate"],
             &["ov", "config", "show"],
             &["ov", "system", "consistency"],
-            &["ov", "system", "backend", "sync-status"],
             &["ov", "admin", "list-accounts"],
         ] {
             assert!(
@@ -4669,9 +4638,6 @@ mod tests {
             &["ov", "system", "status"],
             &["ov", "system", "health"],
             &["ov", "system", "consistency"],
-            &["ov", "system", "backend"],
-            &["ov", "system", "backend", "sync-status"],
-            &["ov", "system", "backend", "sync-retry"],
             &["ov", "system", "crypto"],
             &["ov", "system", "crypto", "init-key"],
             &["ov", "session", "new"],
@@ -5270,42 +5236,6 @@ mod tests {
     }
 
     #[test]
-    fn all_timeout_options_require_positive_finite_seconds() {
-        let command_prefixes = [
-            vec!["ov", "add-resource", "https://example.com", "--timeout"],
-            vec!["ov", "rm", "viking://resources/item", "--timeout"],
-            vec![
-                "ov",
-                "write",
-                "viking://resources/item",
-                "--content",
-                "value",
-                "--timeout",
-            ],
-            vec!["ov", "wait", "--timeout"],
-            vec!["ov", "system", "wait", "--timeout"],
-        ];
-
-        for prefix in command_prefixes {
-            for invalid in ["0", "-1", "inf", "NaN", "1e300"] {
-                let mut args = prefix.clone();
-                args.push(invalid);
-                assert!(
-                    Cli::try_parse_from(&args).is_err(),
-                    "{args:?} should reject an invalid timeout"
-                );
-            }
-
-            let mut args = prefix;
-            args.push("0.1");
-            assert!(
-                Cli::try_parse_from(&args).is_ok(),
-                "{args:?} should accept a positive finite timeout"
-            );
-        }
-    }
-
-    #[test]
     fn all_node_limit_options_accept_zero_and_reject_negative_values() {
         let command_prefixes = [
             vec!["ov", "ls", "--node-limit"],
@@ -5588,10 +5518,6 @@ mod tests {
             (
                 vec!["ov", "system", "consistency", "help"],
                 "ov system consistency --help",
-            ),
-            (
-                vec!["ov", "system", "backend", "sync-status", "help"],
-                "ov system backend sync-status --help",
             ),
         ] {
             let misuse = plain_help_misuse(&os_args(&args))

@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import Response as FastAPIResponse
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openviking.core.namespace import (
     is_hidden_by_actor_peer_view,
@@ -45,7 +45,6 @@ class WriteContentRequest(BaseModel):
     content: str
     mode: str = "replace"
     wait: bool = False
-    timeout: float | None = None
     telemetry: TelemetryRequest = False
     processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
     tags: list[str] | None = None
@@ -60,6 +59,11 @@ class BatchWriteOperation(BaseModel):
     content: str | None = None
     content_base64: str | None = None
     mode: Literal["replace", "append", "create", "upsert"] = "replace"
+    # Optional byte revision, checked under the existing file locks before any writes.
+    expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    tags: list[str] | None = None
+    tag_mode: Literal["replace", "append", "clear"] = "replace"
+    acl: AclSpec | None = None
 
     @model_validator(mode="after")
     def validate_content_shape(self) -> "BatchWriteOperation":
@@ -74,8 +78,10 @@ class BatchWriteRequest(BaseModel):
     root_uri: str
     operations: list[BatchWriteOperation]
     wait: bool = True
-    timeout: float | None = None
     telemetry: TelemetryRequest = False
+    # Preserve conflicting target files and return their URI/reason while writing other files.
+    skip_conflicts: bool = False
+    processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
 
 
 class SetTagsRequest(BaseModel):
@@ -245,7 +251,6 @@ async def write(
             ctx=_ctx,
             mode=request.mode,
             wait=request.wait,
-            timeout=request.timeout,
             processing_mode=request.processing_mode,
             tags=request.tags,
             tag_mode=request.tag_mode,
@@ -280,7 +285,8 @@ async def batch_write(
             operations=operations,
             ctx=_ctx,
             wait=request.wait,
-            timeout=request.timeout,
+            skip_conflicts=request.skip_conflicts,
+            processing_mode=request.processing_mode,
         ),
     )
     return Response(

@@ -11,8 +11,11 @@ from openviking.server.identity import RequestContext, Role
 from openviking.service.resource_service import ResourceService
 from openviking.service.task_store import PersistentTaskStore
 from openviking.service.task_tracker import TaskStatus, TaskTracker
-from openviking.service.task_work_index import QueueTaskMetadata, TaskWorkIndex
-from openviking.telemetry import OperationTelemetry, bind_telemetry
+from openviking.service.task_work_index import QueueTaskMetadata, TaskWorkIndex, get_task_context
+from openviking.telemetry import (
+    OperationTelemetry,
+    bind_telemetry,
+)
 from openviking_cli.session.user_id import UserIdentifier
 from tests.test_task_tracker import _FakeAgfs
 
@@ -100,3 +103,59 @@ async def test_cancel_during_skill_task_creation_settles_persisted_record(monkey
         finally:
             resume.set()
             await asyncio.gather(adding, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_skill_success_remains_completed_when_queue_work_finishes_first(monkeypatch):
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
+    index = TaskWorkIndex()
+    tracker.attach_work_index(index)
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    owner = {"account_id": ctx.account_id, "user_id": ctx.user.user_id}
+
+    async def process_skill(**kwargs):
+        work = QueueTaskMetadata(get_task_context().task_id, "vector", **owner)
+        assert index.register("Embedding", work)
+        index.record_result(work, "completed")
+        await index.prepare_ack("Embedding", work)
+        return {"uri": "viking://agent/skills/demo"}
+
+    service = ResourceService.__new__(ResourceService)
+    service._resource_processor = object()
+    service._viking_fs = object()
+    service._skill_processor = SimpleNamespace(process_skill=process_skill)
+    service._background_tasks = set()
+
+    with bind_telemetry(OperationTelemetry("add-skill")):
+        result = await service.add_skill("body", ctx, wait=True, target_uri="viking://agent/skills")
+
+    task = await tracker.get(result["task_id"], **owner)
+    assert task.status is TaskStatus.COMPLETED
+    assert task.error is None
+    assert task.result["root_uri"] == "viking://agent/skills/demo"
+
+
+@pytest.mark.asyncio
+async def test_skill_failure_preserves_business_error_without_queue_work(monkeypatch):
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    owner = {"account_id": ctx.account_id, "user_id": ctx.user.user_id}
+
+    async def process_skill(**kwargs):
+        raise RuntimeError("skill processing failed")
+
+    service = ResourceService.__new__(ResourceService)
+    service._resource_processor = object()
+    service._viking_fs = object()
+    service._skill_processor = SimpleNamespace(process_skill=process_skill)
+
+    with bind_telemetry(OperationTelemetry("add-skill")):
+        with pytest.raises(RuntimeError, match="skill processing failed"):
+            await service.add_skill("body", ctx, wait=True, target_uri="viking://agent/skills")
+
+    tasks = await tracker.list_tasks(**owner)
+    assert len(tasks) == 1
+    assert tasks[0].status is TaskStatus.FAILED
+    assert tasks[0].error == "skill processing failed"

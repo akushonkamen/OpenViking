@@ -54,7 +54,7 @@ Long-term memories are extracted from a session only after a **commit**. Capture
 | ZCode | Yes, session-aware | Profile, memory index, skills | Every turn | No exit event; turns are already committed | No pre-compaction event |
 | Kimi Code | Yes, session-aware | Profile, memory index, skills, at the first prompt | Every 8 captured messages | Only when `SessionEnd` captures new messages | Commits newly captured messages |
 | OpenCode | Yes, session-aware | Profile, memory index, skills, indexed repositories | At 20,000 pending tokens, when idle | Yes, within the host's cleanup time | Commits around compaction |
-| DSH | Yes, session-aware | Profile, memory index, skills, once per session | At 20,000 pending tokens | Yes, with a 3-second budget | Not observed |
+| DSH | Yes, session-aware | Profile, memory index, skills, once per session | At 20,000 pending tokens | Yes, with a 3-second budget | Commits, then the host summarizes |
 | pi | Yes, session-aware | Profile, memory index, skills, every turn | Takeover on: about 30,000 tokens; off: 20,000 | Takeover on: no; off: yes | Takeover replaces pi's summary |
 | OpenClaw | Yes, session-aware | Profile, every turn | At half the token budget (64,000 by default) | No | The plugin owns compaction |
 | Hermes (bundled) | Yes, session-aware with a fallback | Profile and memory listings | No; only at session boundaries | Yes, if pending uploads finish within 10 seconds | Commits at fork-style compaction |
@@ -297,7 +297,7 @@ Injected context is wrapped in fixed tags such as `<openviking-context>`, and ca
 
 - **Sessions are created implicitly.** The server creates a session when it receives the first message for it, or on the first context-mode recall with that session ID. DSH is the only integration that creates its sessions explicitly.
 - **A commit has two phases.** `POST /api/v1/sessions/{id}/commit` returns after phase 1 archives the messages. Its response includes a `task_id` for phase 2, memory extraction, which runs in the background. A successful commit response does not mean extraction has finished.
-- **`keep_recent_count`** sets how many recent messages a commit leaves live in the session. The server default is 0, which archives everything. Claude Code, Codex, OpenCode, and DSH send 10 on threshold commits; Cursor, TRAE, TRAE CN, ZCode, and Hermes send 0; pi sends the exact message count of its last 3 user turns in takeover mode and 10 otherwise; OpenClaw sends 10 on its threshold commit and 0 on reset, `memory_store`, and compaction.
+- **`keep_recent_count`** sets how many recent messages a commit leaves live in the session. The server default is 0, which archives everything. Claude Code, Codex, OpenCode, DSH, Cursor, TRAE, TRAE CN, ZCode, and Hermes send 0; pi sends the exact message count of its last 3 user turns in takeover mode and 0 otherwise; OpenClaw sends 10 on its threshold commit and 0 on reset, `memory_store`, and compaction.
 - **Server auto-commit is off by default.** `memory.session_auto_commit.enabled` defaults to `false`, and the idle scanner does not start while it is off. A new session can still get a policy from `server.user_config_defaults.auto_commit_policy`, or explicitly through `POST /api/v1/sessions`, `PATCH /api/v1/sessions/{id}/config`, the SDK, or `ov session new --auto-commit-policy-json` and `ov session config set`. A policy's defaults are 150,000 pending tokens (strictly greater than), 100 messages, an 86,400-second idle timeout, `keep_recent_count` 0, and no minimum interval. The idle timeout also needs `memory.session_auto_commit.enabled=true`. The memory plugins send no policy, so without one of these settings the client is the only thing that commits.
 - **Writes are batched.** The shared plugins send up to 100 messages per `POST /messages/batch`, matching the server limit, and fall back to one message at a time when the batch endpoint returns 404 or 405.
 - **Large tool output is stored separately.** The server moves tool output above 20,000 characters into a separate record and leaves a `tool_output_ref`. Plugins raise their own limit (`captureToolMaxChars`) to 1,000,000 only as a safety net.
@@ -319,7 +319,7 @@ Thresholds in this table are client-side. They read the server's pending-token c
 | ZCode | Every `Stop`; turns a missed `Stop` skipped are caught up from the rollout file at the next `Stop` | None | No pre-compaction event |
 | Kimi Code | `Stop` after 8 captured messages since the last commit | `SessionEnd` and `Interrupt` commit when they capture new messages | `PreCompact` commits when it captures new messages |
 | OpenCode | v1 `session.idle`, v2 end of execution: at 20,000 pending tokens | Session deletion, v1 `session.error`, v1 dispose, and v2 cleanup force a commit | v1 before and after compaction; v2 once after compaction ends |
-| DSH | `turn/end` at 20,000 pending tokens | Cordis teardown commits each session | None |
+| DSH | `turn/end` at 20,000 pending tokens | Cordis teardown commits each session | `compaction/start` commits without the threshold check |
 | pi, takeover on (default) | Locally estimated 30,000 tokens with more than 3 user turns | `/viking commit` | `session_before_compact` |
 | pi, takeover off | 20,000 pending tokens after each sync | `session_shutdown` and `/viking commit` | `session_before_compact` |
 | OpenClaw | After a turn, at `tokenBudget × commitTokenThresholdRatio` (128,000 × 0.5 by default) | `/new`, `/reset`, and `memory_store` commit and wait | `compact()` commits and waits up to 5 minutes for extraction |
@@ -396,7 +396,7 @@ When the host shortens its context, most integrations make sure the dropped mess
 | TRAE, TRAE CN, ZCode | Host summarizes | No pre-compaction event | Nothing |
 | Kimi Code | Host summarizes | `PreCompact` commits newly captured messages | Nothing |
 | OpenCode | Host summarizes | v1 flushes and commits; v2 captures the transcript | v1 commits again on `session.compacted`; v2 commits after `session.compaction.ended` |
-| DSH | Not observed | Nothing. Injected context is a user message and shrinks with the host's compaction; the profile is not sent again | Nothing |
+| DSH | Host summarizes | `compaction/start` commits regardless of the token threshold. Injected context is a user message and shrinks with the host's compaction; the profile is not sent again | Nothing |
 | pi | Takeover, on by default | Commits and waits for the archive overview | The overview replaces pi's summary; on failure pi compacts as usual |
 | OpenClaw | The plugin owns compaction | `compact()` commits and waits | The next context assembly rebuilds history from the server |
 | Hermes (bundled) | Host summarizes | Fork-style compaction commits the old session; in-place compaction does nothing | Nothing |

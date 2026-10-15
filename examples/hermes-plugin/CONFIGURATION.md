@@ -101,13 +101,47 @@ home address requires OpenViking 0.4.16 or newer for user and admin keys, or
 | `OPENVIKING_ACCOUNT` | `default` | Tenant account for local/trusted mode |
 | `OPENVIKING_USER` | `default` | Tenant user for local/trusted mode |
 | `OPENVIKING_AGENT` | (none) | Optional peer ID for separate assistant context |
+| `OPENVIKING_EXTRA_HEADERS` | (none) | JSON object of extra HTTP headers (e.g. gateway service tokens); overrides `extra_headers` from the linked `ovcli.conf` |
 
 User and admin API keys let OpenViking derive account/user identity from the key.
-In local or trusted deployments without an API key,
+In trusted deployments, set `OPENVIKING_API_KEY` to the server's root API key;
 Hermes sends `OPENVIKING_ACCOUNT` and `OPENVIKING_USER` as identity headers.
+Only local dev mode allows access without an API key.
 Hermes also sends `User-Agent: openviking-memory-hermes/<version>` on
 OpenViking requests. This header contains the Hermes version. It does not
 contain a user identifier or require an extra request.
+
+### Extra HTTP headers (authenticating gateways)
+
+A server published behind an authenticating gateway (Cloudflare Access,
+oauth2-proxy, an mTLS-terminating proxy) needs a client header on every request,
+including the startup health check.
+
+`extra_headers` is the documented client contract: it sits in the linked
+`ovcli.conf` next to `url`/`api_key` and is what the CLI and the Python/Rust/Go
+clients read. Hermes consumes the same key, so a deployment that already carries
+it needs nothing else:
+
+```json
+{
+  "url": "https://ov.example.com",
+  "api_key": "<user key>",
+  "extra_headers": {
+    "CF-Access-Client-Id": "<service token id>",
+    "CF-Access-Client-Secret": "<service token secret>"
+  }
+}
+```
+
+`OPENVIKING_EXTRA_HEADERS` (a JSON object, read from the profile `.env`) is an
+explicit override for deployment secrets that should not live in a file. It wins
+when both are set, so the resolution order is: profile `OPENVIKING_EXTRA_HEADERS`
+→ linked `ovcli.conf` `extra_headers` → none.
+
+Values must be scalars. `X-OpenViking-*` names are dropped, so an operator-supplied
+map can never assert tenant identity, and the plugin's own headers (authentication,
+tenant, actor) take precedence over the map. The client snapshots the map when it
+is built, so the headers also cover the startup `/health` probe.
 
 ### Optional peer identity
 
@@ -326,7 +360,8 @@ exceed it, and the server may include other context during extraction.
 When Hermes initializes the provider with `agent_context` set to `cron`, `subagent`,
 or `flush`, recall and profile reads keep working. Automatic turn uploads,
 session-end/switch commits, and native memory mirroring are skipped for that
-context. Startup recovery can still commit pending messages from earlier sessions.
+context. Startup recovery also skips commits in these contexts. Pending messages
+remain available for recovery when the next primary context starts.
 Explicit `viking_*` tools keep their normal behavior, including writes and deletes.
 Interactive sessions (and hosts that predate `agent_context`) keep the previous
 automatic write behavior.

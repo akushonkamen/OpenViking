@@ -30,11 +30,13 @@ curl http://localhost:1933/health   # or your remote URL
 
 ### 2. Install the extension
 
-Use the shared installer:
+pi shares the unified installer with the other memory plugins. It asks which harnesses to install and for your OpenViking credentials:
 
 ```bash
-bash examples/memory-plugin-shared/install.sh --harness pi
+curl -fsSL https://openviking.ai/install | bash
 ```
+
+From a repository checkout, `bash examples/memory-plugin-shared/install.sh --harness pi` installs the checkout's extension instead.
 
 The installer installs the locked npm dependencies in a temporary directory before replacing the extension at `~/.pi/agent/extensions/openviking`, which is one of pi's auto-discovery roots, so pi loads it on the next `pi` invocation — no `packages` entry is needed. (Registering the same path with `pi install` would load it twice, so the installer avoids that and clears any stale entry left by older versions.)
 
@@ -185,7 +187,7 @@ integrations should configure category `quotas` when they need exact ceilings.
 | `captureToolResults`     | `false`    | Declared in the shared schema, but this extension never reads it: `lib/capture-adapter.mjs` keeps every structured tool part, so tool results are captured either way, bounded by `captureToolMaxChars` |
 | `captureToolMaxChars`    | `1000000`  | Guard cap on one tool part's `tool_output`; the server externalizes oversized output |
 | `commitTokenThreshold`   | `20000`    | Pending-token threshold for client-driven commit                         |
-| `commitKeepRecentCount`  | `10`       | Live tail kept after commit                                              |
+| `commitKeepRecentCount`  | `10`       | Not read: commits outside takeover archive every captured message (`keep_recent_count` 0); takeover sends the exact message count of the turns it keeps |
 
 ### Context takeover
 

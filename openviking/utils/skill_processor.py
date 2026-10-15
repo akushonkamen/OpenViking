@@ -31,7 +31,6 @@ from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.storage.viking_fs import VikingFS
 from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.telemetry import get_current_telemetry, register_telemetry
-from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.path_safety import safe_join_viking_uri
 from openviking.utils.zip_safe import safe_extract_zip
 from openviking_cli.exceptions import InvalidArgumentError
@@ -491,9 +490,7 @@ class SkillProcessor:
             "content": content,
         }
         if self._vlm_resolver is None:
-            raise RuntimeError(
-                "SkillProcessor requires a VLM resolver for account-owned work"
-            )
+            raise RuntimeError("SkillProcessor requires a VLM resolver for account-owned work")
         extraction_kwargs["vlm"] = await self._vlm_resolver.get_vlm(ctx.account_id)
         extraction_result = await extract_skill_privacy_values(**extraction_kwargs)
         if not extraction_result.values:
@@ -657,8 +654,6 @@ class SkillProcessor:
 
         telemetry = get_current_telemetry()
         register_telemetry(telemetry)
-        tracker = get_request_wait_tracker()
-        tracker.register_request(telemetry.telemetry_id)
         msg = SemanticMsg(
             uri=uri,
             context_type="skill",
@@ -673,8 +668,6 @@ class SkillProcessor:
             propagate_to_parent=False,
             source={"path": source_path},
         )
-        tracker.register_semantic_root(msg.telemetry_id, msg.id)
-        tracker.retain_request(msg.telemetry_id, msg.id)
         handed_off = False
         try:
             queue_manager = get_queue_manager()
@@ -683,8 +676,7 @@ class SkillProcessor:
             await viking_fs._async_agfs.pathlock_handoff(lease)
             handed_off = True
             await queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True).enqueue(msg)
-        except BaseException as exc:
-            tracker.mark_semantic_failed(msg.telemetry_id, msg.id, str(exc))
+        except BaseException:
             if handed_off:
                 # Enqueue was rejected/failed. Return ownership to the caller's
                 # finally block; adopting creates a new owned lease reference.

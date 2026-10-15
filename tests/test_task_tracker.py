@@ -5,6 +5,7 @@
 
 import asyncio
 import json
+import threading
 import time
 from copy import deepcopy
 
@@ -19,8 +20,15 @@ from openviking.service.task_tracker import (
     TaskTracker,
     _sanitize_error,
     get_task_tracker,
+    run_tracked_operation,
     set_task_tracker,
 )
+from openviking.service.task_work_index import (
+    QueueTaskMetadata,
+    TaskWorkIndex,
+    get_task_context,
+)
+from openviking_cli.exceptions import DeadlineExceededError
 from openviking_cli.session.user_id import UserIdentifier
 
 pytestmark = pytest.mark.asyncio
@@ -620,6 +628,294 @@ async def test_get_task_tracker_requires_service_initialization():
         get_task_tracker()
 
 
+async def test_wait_timeout_preserves_recorded_operation_result(tracker):
+    index = TaskWorkIndex()
+    tracker.attach_work_index(index)
+    set_task_tracker(tracker)
+    state = {}
+
+    async def operation():
+        context = get_task_context()
+        state["task_id"] = context.task_id
+        work = QueueTaskMetadata(
+            context.task_id,
+            "child-work",
+            context.account_id,
+            context.user_id,
+        )
+        assert index.register("Semantic", work)
+        return {"status": "success", "root_uri": "resource-result"}
+
+    with pytest.raises(DeadlineExceededError) as caught:
+        await run_tracked_operation(
+            "content_write",
+            account_id="acme",
+            user_id="alice",
+            operation=operation,
+            wait=True,
+            timeout=0,
+        )
+
+    task = await tracker.get(state["task_id"], **_owner_kwargs())
+    assert "task_id" not in caught.value.details
+    assert task.status is TaskStatus.RUNNING
+    assert task.result == {
+        "status": "success",
+        "root_uri": "resource-result",
+        "task_id": state["task_id"],
+    }
+
+
+async def test_accept_failed_result_returns_structured_partial_result(tracker):
+    index = TaskWorkIndex()
+    tracker.attach_work_index(index)
+    set_task_tracker(tracker)
+    workers = []
+
+    async def operation():
+        context = get_task_context()
+        work = QueueTaskMetadata(
+            context.task_id,
+            "embedding-work",
+            context.account_id,
+            context.user_id,
+        )
+        assert index.register("Embedding", work)
+
+        async def fail_work():
+            await asyncio.sleep(0)
+            index.record_result(work, "failed", error="embedding failed")
+            await index.prepare_ack("Embedding", work)
+
+        workers.append(asyncio.create_task(fail_work()))
+        return {
+            "status": "completed",
+            "failed_records": 1,
+            "warnings": ["Embedding queue failed during reindex: embedding failed"],
+        }
+
+    result, task_id = await run_tracked_operation(
+        "admin_reindex",
+        account_id="acme",
+        user_id="alice",
+        operation=operation,
+        wait=True,
+        accept_failed_result=lambda value: (
+            isinstance(value, dict) and value.get("failed_records", 0) > 0
+        ),
+    )
+
+    assert result["failed_records"] == 1
+    task = await tracker.wait(task_id, **_owner_kwargs(), timeout=1)
+    assert task.status is TaskStatus.FAILED
+    assert task.result["failed_records"] == 1
+    await asyncio.gather(*workers)
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_message"),
+    [
+        (TimeoutError("operation timed out"), "operation timed out"),
+        (DeadlineExceededError("queue processing", 0.1), "Queue processing timed out after 0.1s"),
+    ],
+)
+async def test_operation_timeout_marks_task_failed(tracker, raised, expected_message):
+    set_task_tracker(tracker)
+    state = {}
+
+    async def operation():
+        state["task_id"] = get_task_context().task_id
+        raise raised
+
+    with pytest.raises(type(raised)):
+        await run_tracked_operation(
+            "content_write",
+            account_id="acme",
+            user_id="alice",
+            operation=operation,
+            wait=True,
+            timeout=0.1,
+        )
+
+    task = await tracker.get(state["task_id"], **_owner_kwargs())
+    assert task.status is TaskStatus.FAILED
+    assert task.error == expected_message
+
+
+async def test_wait_false_still_finishes_top_level_operation(tracker):
+    set_task_tracker(tracker)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def operation():
+        started.set()
+        await release.wait()
+        return {"status": "success", "value": 1}
+
+    running = asyncio.create_task(
+        run_tracked_operation(
+            "content_write",
+            account_id="acme",
+            user_id="alice",
+            operation=operation,
+            wait=False,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert not running.done()
+
+    release.set()
+    (result, task_id) = await asyncio.wait_for(running, timeout=1)
+    assert result == {"status": "success", "value": 1, "task_id": task_id}
+    completed = await tracker.get(task_id, **_owner_kwargs())
+    assert completed.status is TaskStatus.COMPLETED
+    assert completed.result == {
+        "status": "success",
+        "value": 1,
+        "task_id": task_id,
+    }
+
+
+@pytest.mark.parametrize("cancel_status", ["pending", "running"])
+async def test_cancel_during_operation_startup_settles_persisted_task(cancel_status):
+    """Cancellation must not orphan a task whose store write has already started."""
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    class BlockingAgfs(_FakeAgfs):
+        def write(self, path, data, *args, **kwargs):
+            if json.loads(data)["status"] == cancel_status:
+                loop.call_soon_threadsafe(started.set)
+                assert release.wait(3)
+            return super().write(path, data, *args, **kwargs)
+
+    agfs = BlockingAgfs()
+    tracker = TaskTracker(PersistentTaskStore(agfs))
+    set_task_tracker(tracker)
+    operation_called = False
+
+    async def operation():
+        nonlocal operation_called
+        operation_called = True
+        return {"ok": True}
+
+    running = asyncio.create_task(
+        run_tracked_operation("content_write", **_owner_kwargs(), operation=operation, wait=False)
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        running.cancel()
+        await asyncio.sleep(0)
+        running.cancel()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(running, 1)
+
+    assert not operation_called
+    persisted = await TaskTracker(PersistentTaskStore(agfs)).list_tasks(**_owner_kwargs())
+    assert len(persisted) == 1
+    assert persisted[0].status is TaskStatus.FAILED
+    assert persisted[0].error == "CancelledError"
+    assert (
+        await tracker.wait(persisted[0].task_id, **_owner_kwargs(), timeout=0)
+    ).status is TaskStatus.FAILED
+
+
+async def test_operation_start_failure_settles_created_task():
+    class FailingAgfs(_FakeAgfs):
+        def write(self, path, data, *args, **kwargs):
+            if json.loads(data)["status"] == "running":
+                raise OSError("start write failed")
+            return super().write(path, data, *args, **kwargs)
+
+    tracker = TaskTracker(PersistentTaskStore(FailingAgfs()))
+    set_task_tracker(tracker)
+
+    async def operation():
+        pytest.fail("operation must not run after start fails")
+
+    with pytest.raises(OSError, match="start write failed"):
+        await run_tracked_operation(
+            "content_write", **_owner_kwargs(), operation=operation, wait=False
+        )
+
+    tasks = await tracker.list_tasks(**_owner_kwargs())
+    assert len(tasks) == 1
+    assert tasks[0].status is TaskStatus.FAILED
+    assert tasks[0].error == "start write failed"
+
+
+@pytest.mark.parametrize("timeout", [0, 0.01])
+async def test_wait_timeout_excludes_operation_time_for_completed_task(tracker, timeout):
+    set_task_tracker(tracker)
+
+    async def operation():
+        await asyncio.sleep(0.02)
+        return {"status": "success"}
+
+    result, task_id = await run_tracked_operation(
+        "content_write",
+        account_id="acme",
+        user_id="alice",
+        operation=operation,
+        wait=True,
+        timeout=timeout,
+    )
+
+    assert result == {"status": "success"}
+    completed = await tracker.wait(task_id, **_owner_kwargs(), timeout=0)
+    assert completed.status is TaskStatus.COMPLETED
+    assert completed.result["status"] == "success"
+    assert completed.result["task_id"] == task_id
+
+
+async def test_multiple_queue_waits_share_budget_and_leave_task_pollable(tracker):
+    index = TaskWorkIndex()
+    tracker.attach_work_index(index)
+    set_task_tracker(tracker)
+    state = {}
+
+    async def operation():
+        task_id = get_task_context().task_id
+        state["task_id"] = task_id
+        first = QueueTaskMetadata(task_id, "first", "acme", "alice")
+        assert index.register("Semantic", first)
+        # Exhaust the budget on a caught wait, then make the first Work complete.
+        with pytest.raises(TimeoutError):
+            await tracker.wait_for_work(task_id, [first.work_id], timeout=0.01)
+        index.record_result(first, "completed")
+        await index.prepare_ack("Semantic", first)
+        second = QueueTaskMetadata(task_id, "second", "acme", "alice")
+        assert index.register("Embedding", second)
+        state["second"] = second
+        with pytest.raises(TimeoutError):
+            await tracker.wait_for_task_work(task_id, timeout=60)
+        return {"status": "success"}
+
+    with pytest.raises(DeadlineExceededError) as caught:
+        await asyncio.wait_for(
+            run_tracked_operation(
+                "content_write",
+                **_owner_kwargs(),
+                operation=operation,
+                wait=True,
+                timeout=0.01,
+            ),
+            timeout=1,
+        )
+    assert "task_id" not in caught.value.details
+    task = await tracker.get(state["task_id"], **_owner_kwargs())
+    assert task.status is TaskStatus.RUNNING
+    assert task.error is None
+    index.record_result(state["second"], "completed")
+    await index.prepare_ack("Embedding", state["second"])
+    assert (
+        await tracker.wait(task.task_id, **_owner_kwargs(), timeout=0)
+    ).status is TaskStatus.COMPLETED
+
+
 async def test_persistent_store_cross_tracker_visibility():
     agfs = _FakeAgfs()
     store = PersistentTaskStore(agfs)
@@ -896,27 +1192,11 @@ async def test_terminal_event_waits_for_owned_work(tracker, outcome):
     )
     snapshot = await tracker.get(task.task_id, **owner)
     assert snapshot.status == TaskStatus.RUNNING
-    waiting = asyncio.create_task(tracker.wait_for_descendants(task.task_id, "parent-work"))
-
-    # Observe the public history while work remains, not a helper call sequence.
-    async def observed_wait():
-        while True:
-            record = await tracker.get(task.task_id, **owner)
-            if record.execution_events["items"][-1]["kind"] == "waiting_for_descendants":
-                return
-            await asyncio.sleep(0)
-
-    try:
-        await asyncio.wait_for(observed_wait(), timeout=2)
-    finally:
-        await work_index.prepare_ack("Semantic", child)
-        await waiting
+    await work_index.prepare_ack("Semantic", child)
     snapshot = await tracker.get(task.task_id, **owner)
     last = snapshot.execution_events["items"][-1]
     assert last["kind"] == "status_changed"
     assert last["status"] == ("completed" if outcome == "complete" else "failed")
-    await tracker.wait_for_descendants(task.task_id, "parent-work")
-    assert (await tracker.get(task.task_id, **owner)).execution_events == snapshot.execution_events
 
 
 async def test_legacy_tasks_do_not_get_invented_history():
@@ -980,7 +1260,7 @@ async def test_process_events_respect_owner_and_terminal_boundaries(tracker):
 
 async def test_processing_time_persists_and_restored_active_tasks_are_unknown(tracker, monkeypatch):
     now = [0.0]
-    monkeypatch.setattr("openviking.service.task_processing_time.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("openviking.service.task_work_index.time.time", lambda: now[0])
     task = await tracker.create("add_resource", **_owner_kwargs())
     await tracker.start(task.task_id, **_owner_kwargs())
     now[0] = 10
@@ -991,14 +1271,15 @@ async def test_processing_time_persists_and_restored_active_tasks_are_unknown(tr
     await tracker.update_stage(task.task_id, "semantic", **_owner_kwargs())
     restarted = TaskTracker(store=tracker._store)
     assert (await restarted.get(task.task_id, **_owner_kwargs())).processing_seconds is None
-    with tracker._work_index.pause_processing(task.task_id):
-        now[0] = 30
-        assert (await tracker.get(task.task_id)).processing_seconds == 3
+    # Waiting, I/O, and backoff after a worker claims the task remain part of
+    # worker-occupied wall time.
+    now[0] = 30
+    assert (await tracker.get(task.task_id)).processing_seconds == 20
     now[0] = 32
     await tracker.complete(task.task_id, result={"ok": True}, **_owner_kwargs())
     await tracker.unregister_running_task(task.task_id)
     finished = await tracker.get(task.task_id)
     assert finished.status == TaskStatus.COMPLETED
-    assert finished.to_dict()["processing_seconds"] == 5
+    assert finished.to_dict()["processing_seconds"] == 22
     restored = await TaskTracker(store=tracker._store).get(task.task_id, **_owner_kwargs())
-    assert restored.processing_seconds == 5
+    assert restored.processing_seconds == 22

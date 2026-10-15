@@ -46,7 +46,6 @@ from openviking.server.mcp_endpoint import (
 from openviking.server.mcp_endpoint import ls as list_tool
 from openviking.service.fs_service import ListingPage
 from openviking_cli.exceptions import (
-    AlreadyExistsError,
     FailedPreconditionError,
     InvalidArgumentError,
     InvalidURIError,
@@ -1698,6 +1697,7 @@ async def test_add_resource_remote_parent_is_forwarded(service, monkeypatch):
     )
 
     assert captured["parent"] == "viking://resources/imports"
+    assert captured["create_parent"] is True
     assert captured["to"] is None
 
 
@@ -1785,15 +1785,20 @@ async def test_add_resource_temp_file_id_branch_resolves_and_ingests(
 
     async def fake_add_resource(*, path, ctx, **kwargs):
         captured["path"] = path
-        captured["allow_local_path_resolution"] = kwargs.get("allow_local_path_resolution")
+        captured.update(kwargs)
         return {"root_uri": "viking://resources/from_tfid"}
 
     monkeypatch.setattr(service.resources, "add_resource", fake_add_resource)
 
-    result = await add_resource(temp_file_id=tfid)
+    result = await add_resource(
+        temp_file_id=tfid,
+        parent="viking://resources/imports",
+    )
     assert "Resource added" in result
     assert captured["path"] == str(target.resolve())
     assert captured["allow_local_path_resolution"] is True
+    assert captured["parent"] == "viking://resources/imports"
+    assert captured["create_parent"] is True
     upload_token_store.clear()
 
 
@@ -2014,11 +2019,12 @@ async def test_write_replace_overwrites_existing(service):
     assert body == "v2-content"
 
 
-async def test_write_create_fails_when_file_exists(service):
+async def test_write_create_overwrites_existing_file(service):
     uri = "viking://resources/test_write_create_exists.md"
     await write(uri=uri, content="v1")
-    with pytest.raises(AlreadyExistsError):
-        await write(uri=uri, content="v2", mode="create")
+    result = await write(uri=uri, content="v2", mode="create")
+    assert "mode=create" in result
+    assert await service.fs.read(uri, ctx=DEFAULT_CTX) == "v2"
 
 
 async def test_write_append_appends_to_existing(service):
@@ -2029,11 +2035,11 @@ async def test_write_append_appends_to_existing(service):
     assert body == "line1\nline2\n"
 
 
-async def test_write_append_missing_file_fails(service):
-    with pytest.raises(NotFoundError):
-        await write(
-            uri="viking://resources/test_write_append_missing.md", content="x", mode="append"
-        )
+async def test_write_append_creates_missing_file(service):
+    uri = "viking://resources/test_write_append_missing.md"
+    result = await write(uri=uri, content="x", mode="append")
+    assert "mode=append" in result
+    assert await service.fs.read(uri, ctx=DEFAULT_CTX) == "x"
 
 
 async def test_write_create_rejects_disallowed_extension(service):

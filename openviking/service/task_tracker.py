@@ -18,11 +18,13 @@ import math
 import re
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, TypeVar
 from uuid import uuid4
 
 from openviking.service.task_events import (
@@ -30,7 +32,6 @@ from openviking.service.task_events import (
     TaskEventHistory,
     append_task_event,
 )
-from openviking.service.task_processing_time import pause_task_processing
 from openviking.service.task_store import TaskStore
 from openviking.service.task_tracker_concurrency import (
     KeyedAsyncLockPool,
@@ -38,9 +39,35 @@ from openviking.service.task_tracker_concurrency import (
     run_to_completion,
 )
 from openviking.service.task_work_index import QueueTaskMetadata, TaskWorkIndex
+from openviking_cli.exceptions import DeadlineExceededError, OpenVikingError
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
+_OperationResult = TypeVar("_OperationResult")
+
+
+@dataclass
+class _WaitBudget:
+    task_id: str
+    remaining: float
+
+
+_wait_budget: ContextVar[Optional[_WaitBudget]] = ContextVar("task_wait_budget", default=None)
+
+
+@contextmanager
+def _consume_wait_budget(task_id: str, timeout: Optional[float]) -> Iterator[Optional[float]]:
+    """Charge only time spent waiting, shared across an inline operation."""
+    budget = _wait_budget.get()
+    if budget is None or budget.task_id != task_id:
+        yield timeout
+        return
+    allowed = budget.remaining if timeout is None else min(timeout, budget.remaining)
+    started = time.monotonic()
+    try:
+        yield max(0.0, allowed)
+    finally:
+        budget.remaining = max(0.0, budget.remaining - (time.monotonic() - started))
 
 
 class _CommittedMutationCancelled(asyncio.CancelledError):
@@ -60,6 +87,7 @@ class TaskStatus(str, Enum):
 
 _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
 _ACTIVE_STATUSES = (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.CANCELLING)
+_PUBLIC_QUEUE_NAMES = ("Semantic", "Embedding")
 
 _CANCELLABLE_TASK_TYPES = {
     "add_resource",
@@ -145,6 +173,138 @@ def set_task_tracker(tracker: "TaskTracker") -> None:
     global _instance
     with _init_lock:
         _instance = tracker
+
+
+async def run_tracked_operation(
+    task_type: str,
+    *,
+    account_id: str,
+    user_id: str,
+    operation: Callable[[], Awaitable[_OperationResult]],
+    wait: bool,
+    timeout: Optional[float] = None,
+    resource_id: Optional[str] = None,
+    existing_task: Optional[TaskRecord] = None,
+    accept_failed_result: Callable[[_OperationResult], bool] | None = None,
+) -> tuple[_OperationResult, str]:
+    """Run a top-level operation under a Task, reusing an existing Task context.
+
+    ``accept_failed_result`` is reserved for operations whose result explicitly
+    reports record-level failures while the Task retains its failed status.
+    """
+    from openviking.service.task_work_index import bind_task_context, get_task_context
+
+    current = get_task_context()
+    if current is not None:
+        return await operation(), current.task_id
+
+    tracker = get_task_tracker()
+    created_task: Optional[TaskRecord] = existing_task
+
+    async def create_task() -> None:
+        nonlocal created_task
+        created_task = await tracker.create(
+            task_type,
+            resource_id=resource_id,
+            account_id=account_id,
+            user_id=user_id,
+        )
+
+    try:
+        # Keep the committed record reachable even if the caller is cancelled
+        # while the store write is still running.
+        if created_task is None:
+            await run_to_completion(create_task)
+        assert created_task is not None
+        task = created_task
+        await run_to_completion(
+            lambda: tracker.start(task.task_id, account_id=account_id, user_id=user_id)
+        )
+    except BaseException as exc:
+        if created_task is not None:
+            failed_task_id = created_task.task_id
+            failure_message = str(exc) or type(exc).__name__
+            await run_to_completion(
+                lambda: tracker.fail(
+                    failed_task_id,
+                    failure_message,
+                    account_id=account_id,
+                    user_id=user_id,
+                )
+            )
+        raise
+    enqueued_work: list[tuple[str, str]] = []
+
+    async def execute_operation() -> _OperationResult:
+        tracker.register_running_task(task.task_id)
+        try:
+            with bind_task_context(
+                task.task_id,
+                account_id,
+                user_id,
+                enqueued_work=enqueued_work,
+            ):
+                result = await operation()
+            task_result = deepcopy(result) if isinstance(result, dict) else {"result": result}
+            task_result.setdefault("task_id", task.task_id)
+            await tracker.complete(
+                task.task_id,
+                task_result,
+                account_id=account_id,
+                user_id=user_id,
+                resource_id=resource_id,
+            )
+            if isinstance(result, dict) and not wait:
+                result.setdefault("task_id", task.task_id)
+            return result
+        except _CommittedMutationCancelled:
+            raise
+        except BaseException as exc:
+            failure_message = str(exc) or type(exc).__name__
+            await run_to_completion(
+                lambda: tracker.fail(
+                    task.task_id,
+                    failure_message,
+                    account_id=account_id,
+                    user_id=user_id,
+                )
+            )
+            raise
+        finally:
+            await tracker.unregister_running_task(task.task_id)
+
+    token = _wait_budget.set(
+        _WaitBudget(task.task_id, timeout) if wait and timeout is not None else None
+    )
+    try:
+        result = await execute_operation()
+        if wait:
+            try:
+                terminal = await tracker.wait(
+                    task.task_id,
+                    account_id=account_id,
+                    user_id=user_id,
+                    timeout=timeout,
+                )
+                if terminal.status == TaskStatus.FAILED and not (
+                    accept_failed_result is not None and accept_failed_result(result)
+                ):
+                    raise OpenVikingError(
+                        terminal.error or "Task processing failed",
+                        code="PROCESSING_ERROR",
+                        details={"task_id": task.task_id},
+                    )
+                if terminal.status == TaskStatus.CANCELLED:
+                    raise OpenVikingError(
+                        "Task processing was cancelled",
+                        code="PROCESSING_ERROR",
+                        details={"task_id": task.task_id, "status": "cancelled"},
+                    )
+            except (TimeoutError, asyncio.TimeoutError) as exc:
+                raise DeadlineExceededError("queue processing", timeout) from exc
+        return result, task.task_id
+    finally:
+        _wait_budget.reset(token)
 
 
 # ── Sanitization ──
@@ -290,17 +450,20 @@ class TaskTracker:
         for task_id in expired_ids:
             evicted_count += await self._delete_expired_task(task_id, now)
 
-        capacity_evicted = []
+        capacity_evicted: list[tuple[str, bool]] = []
         with self._lock:
             if len(self._tasks) > self.MAX_TASKS:
                 sorted_tasks = sorted(self._tasks.items(), key=lambda x: x[1].created_at)
                 excess = len(self._tasks) - self.MAX_TASKS
-                for tid, _ in sorted_tasks[:excess]:
+                for tid, task in sorted_tasks[:excess]:
                     self._tasks.pop(tid, None)
-                    capacity_evicted.append(tid)
+                    capacity_evicted.append((tid, task.status in _TERMINAL_STATUSES))
 
-        for tid in capacity_evicted:
-            self._work_index.forget_processing(tid)
+        for tid, terminal in capacity_evicted:
+            if terminal:
+                self._work_index.forget_task(tid)
+            else:
+                self._work_index.forget_processing(tid)
 
         if evicted_count:
             logger.debug("[TaskTracker] Evicted %d expired tasks", evicted_count)
@@ -345,7 +508,7 @@ class TaskTracker:
 
             with self._lock:
                 self._tasks.pop(task_id, None)
-            self._work_index.forget_processing(task_id)
+            self._work_index.forget_task(task_id)
             return True
 
     @staticmethod
@@ -633,7 +796,12 @@ class TaskTracker:
                     updated.status = terminal_status
                     updated.stage = terminal_status.value
                 updated.updated_at = self._next_updated_at(task)
-                updated.auth = {}
+                enqueue_markers = updated.auth.get("enqueue_complete_work_ids")
+                updated.auth = (
+                    {"enqueue_complete_work_ids": deepcopy(enqueue_markers)}
+                    if enqueue_markers
+                    else {}
+                )
                 try:
                     await self._persist_and_publish("update", updated, previous=task)
                 except _CommittedMutationCancelled as exc:
@@ -760,7 +928,11 @@ class TaskTracker:
                 elif updated.result is not None:
                     updated.status = TaskStatus.COMPLETED
                 else:
-                    return
+                    updated.error = "Task operation interrupted before its result was persisted"
+                    updated.status = TaskStatus.FAILED
+                work_status = self._work_index.queue_status(task_id)
+                if updated.result is not None and work_status:
+                    updated.result["queue_status"] = self._public_queue_status(work_status)
                 updated.stage = updated.status.value
                 updated.updated_at = self._next_updated_at(task)
                 updated.auth = {}
@@ -778,18 +950,24 @@ class TaskTracker:
     ) -> TaskRecord:
         """Wait for one task's terminal state without changing its lifecycle."""
 
-        async def _poll() -> TaskRecord:
+        with _consume_wait_budget(task_id, timeout) as remaining:
+            deadline = None if remaining is None else time.monotonic() + remaining
             while True:
-                task = await self.get(task_id, account_id=account_id, user_id=user_id)
+                lookup = self.get(task_id, account_id=account_id, user_id=user_id)
+                if remaining is not None and self._cached_task(task_id) is None:
+                    task = await asyncio.wait_for(lookup, max(0.0, remaining))
+                else:
+                    task = await lookup
                 if task is None:
                     raise KeyError(f"Task not found: {task_id}")
                 if task.status in _TERMINAL_STATUSES:
                     return task
-                await asyncio.sleep(poll_interval)
-
-        if timeout is None:
-            return await _poll()
-        return await asyncio.wait_for(_poll(), timeout)
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError(f"Timed out waiting for Task {task_id}")
+                await asyncio.sleep(
+                    poll_interval if remaining is None else min(poll_interval, remaining)
+                )
 
     async def get_task_auth(
         self,
@@ -819,8 +997,7 @@ class TaskTracker:
             for task_id in task_ids:
                 del self._tasks[task_id]
         for task_id in task_ids:
-            self._work_index.clear_failure(task_id)
-            self._work_index.forget_processing(task_id)
+            self._work_index.forget_task(task_id)
 
     async def delete_user_tasks(self, account_id: str, user_id: str) -> int:
         """Delete terminal task records for one user from storage and cache."""
@@ -860,26 +1037,126 @@ class TaskTracker:
                 )
                 with self._lock:
                     self._tasks.pop(task.task_id, None)
-                self._work_index.forget_processing(task.task_id)
-                self._work_index.clear_failure(task.task_id)
+                self._work_index.forget_task(task.task_id)
                 deleted += 1
         return deleted
 
-    async def wait_for_descendants(self, task_id: str, current_work_id: str) -> None:
-        """Wait on the same durable work index used by completion and cancellation."""
-        if self._work_index.has_work(task_id, exclude_work_id=current_work_id):
-            task = self._cached_task(task_id)
-            if task and task.account_id and task.user_id:
-                await self.record_event(
-                    task_id,
-                    "waiting_for_descendants",
-                    operation=current_work_id,
-                    account_id=task.account_id,
-                    user_id=task.user_id,
+    async def wait_for_work(
+        self,
+        task_id: str,
+        work_ids: List[str],
+        *,
+        timeout: Optional[float] = None,
+        stop_waiting: Optional[Any] = None,
+    ) -> None:
+        """Wait only for the supplied logical Work IDs to become terminal."""
+        with _consume_wait_budget(task_id, timeout) as remaining:
+            await self._work_index.wait_for_work(
+                task_id,
+                work_ids,
+                timeout=remaining,
+                stop_waiting=stop_waiting,
+            )
+
+    async def wait_for_task_work(
+        self,
+        task_id: str,
+        *,
+        exclude_work_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """Let a root coordinator drain its Task's other queue deliveries."""
+        with _consume_wait_budget(task_id, timeout) as remaining:
+            await self._work_index.wait_for_task_work(
+                task_id, exclude_work_id=exclude_work_id, timeout=remaining
+            )
+
+    async def mark_enqueue_complete(
+        self,
+        task_id: str,
+        work_id: str,
+        *,
+        account_id: str,
+        user_id: str,
+    ) -> None:
+        """Persist that a coordinator's complete child Work set is durable."""
+        async with self._task_locks.acquire(task_id):
+            task = await self._load_for_update(task_id, account_id, user_id)
+            if task is None or task.status not in _ACTIVE_STATUSES:
+                return
+            updated = deepcopy(task)
+            completed = set(updated.auth.get("enqueue_complete_work_ids") or ())
+            completed.add(work_id)
+            updated.auth["enqueue_complete_work_ids"] = sorted(completed)
+            updated.updated_at = self._next_updated_at(task)
+            await self._persist_and_publish("update", updated, previous=task)
+
+    async def is_enqueue_complete(
+        self,
+        task_id: str,
+        work_id: str,
+        *,
+        account_id: str,
+        user_id: str,
+    ) -> bool:
+        """Check the durable producer marker used by a lock coordinator."""
+        auth = await self.get_task_auth(
+            task_id,
+            account_id=account_id,
+            user_id=user_id,
+        )
+        return work_id in set(auth.get("enqueue_complete_work_ids") or ())
+
+    def build_queue_status(
+        self,
+        task_id: str,
+        work_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, object]]:
+        """Project Task-scoped queue outcomes from logical Work."""
+        return self._public_queue_status(self._work_index.queue_status(task_id, work_ids))
+
+    @staticmethod
+    def _public_queue_status(
+        status: Dict[str, Dict[str, object]],
+    ) -> Dict[str, Dict[str, object]]:
+        result: Dict[str, Dict[str, object]] = {}
+        for queue_name in _PUBLIC_QUEUE_NAMES:
+            queue_status = deepcopy(
+                status.get(
+                    queue_name,
+                    {
+                        "processed": 0,
+                        "requeue_count": 0,
+                        "error_count": 0,
+                        "errors": [],
+                    },
                 )
-        with pause_task_processing():
-            while self._work_index.has_work(task_id, exclude_work_id=current_work_id):
-                await asyncio.sleep(0.05)
+            )
+            errors = queue_status.get("errors")
+            if isinstance(errors, list):
+                queue_status["errors"] = [
+                    {
+                        **error,
+                        "message": _sanitize_error(str(error.get("message") or "")),
+                    }
+                    if isinstance(error, dict)
+                    else {"message": _sanitize_error(str(error))}
+                    for error in errors[:100]
+                ]
+            result[queue_name] = queue_status
+        return result
+
+    def get_queue_timing(self, task_id: str) -> Dict[str, Dict[str, float]]:
+        """Return Task-scoped queue wait and execution durations."""
+        return self._work_index.queue_timing(task_id)
+
+    def get_context_count(self, task_id: str) -> int:
+        """Return successful context writes recorded by Task Work."""
+        return self._work_index.context_count(task_id)
+
+    def record_context_count(self, task_id: str, work_id: str, delta: int = 1) -> None:
+        """Record successful context writes against one logical Work."""
+        self._work_index.record_context_count(task_id, work_id, delta)
 
     async def record_event(
         self,
@@ -916,9 +1193,13 @@ class TaskTracker:
             updated.updated_at = self._next_updated_at(task)
             await self._persist_and_publish("update", updated, previous=task)
 
-    def has_work(self, task_id: str) -> bool:
+    def has_work(self, task_id: str, *, exclude_work_id: Optional[str] = None) -> bool:
         """Return whether a task still owns durable or active queue work."""
-        return self._work_index.has_work(task_id)
+        return self._work_index.has_work(task_id, exclude_work_id=exclude_work_id)
+
+    def has_active_producer(self, task_id: str) -> bool:
+        """Return whether another active handler can persist an enqueue marker."""
+        return self._work_index.has_other_active(task_id, asyncio.current_task())
 
     def register_running_task(self, task_id: str) -> None:
         """Register the current asyncio task so cancellation can interrupt it."""
@@ -987,7 +1268,7 @@ class TaskTracker:
             )
             with self._lock:
                 self._tasks.pop(task.task_id, None)
-            self._work_index.forget_processing(task.task_id)
+            self._work_index.forget_task(task.task_id)
             return True
 
     async def list_page(
@@ -1132,7 +1413,7 @@ class TaskTracker:
         # Build history before the same physical write as the state transition.
         if operation == "update" and previous is None:
             raise ValueError("Task updates require the previous snapshot")
-        # Persist the final measured union; restored active tasks have no complete clock.
+        # Persist the final Work interval union; restored active tasks lack full timing coverage.
         if previous is None or previous.status in _ACTIVE_STATUSES:
             task.processing_seconds = self._work_index.processing_seconds(task.task_id)
         kinds = []

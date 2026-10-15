@@ -914,11 +914,8 @@ class OpenAPIChannel(BaseChannel):
             rebuilt["agent_id"] = agent_id
             return OpenVikingConnection(**rebuilt)
 
-        # Keyless forwards are only valid for trusted/dev upstreams. In api_key
-        # mode, unauthenticated /health still returns 200 with auth_mode and no
-        # resolved identity, so claimed account/user/role must not be accepted
-        # without a real API key (Web Studio review on #4866).
-        if auth_mode not in {"trusted", "dev"}:
+        # Only dev mode accepts forwarded identities without an API key.
+        if auth_mode != "dev":
             raise HTTPException(
                 status_code=401,
                 detail=(
@@ -927,7 +924,7 @@ class OpenAPIChannel(BaseChannel):
                 ),
             )
 
-        # Trusted / DEV forwards may omit api_key; keep proxy-asserted identity
+        # DEV forwards may omit api_key; keep proxy-asserted identity
         # but never honor a client-chosen upstream URL.
         values["server_url"] = self._ov_server_url()
         values["agent_id"] = agent_id
@@ -987,10 +984,7 @@ class OpenAPIChannel(BaseChannel):
         if not self._ov_server_url():
             return None
         api_key = self._extract_api_key(request)
-        configured_api_key = str(
-            getattr(getattr(self._global_config, "ov_server", None), "api_key", "") or ""
-        ).strip()
-        if not api_key and configured_api_key:
+        if not api_key:
             raise HTTPException(status_code=401, detail="OpenViking API key header required")
         account_id = str(request.headers.get("X-OpenViking-Account") or "").strip()
         user_id = str(request.headers.get("X-OpenViking-User") or "").strip()

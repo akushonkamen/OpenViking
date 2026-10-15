@@ -27,6 +27,8 @@ from openviking.privacy import (
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
+from openviking.service.task_tracker import get_task_tracker, run_tracked_operation
+from openviking.service.task_work_index import get_enqueued_work_ids, get_task_context
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.content_visibility import visible_content
 from openviking.storage.abstract_overview import (
@@ -45,8 +47,6 @@ from openviking.storage.vector_ids import is_vector_record_id
 from openviking.storage.viking_fs import VikingFS
 from openviking.storage.vikingdb_manager import VikingDBManagerProxy
 from openviking.telemetry import get_current_telemetry
-from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
-from openviking.telemetry.resource_summary import build_queue_status_payload
 from openviking.utils.embedding_utils import vectorize_directory_meta
 from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.path_safety import validate_safe_viking_uri_path
@@ -456,7 +456,31 @@ class FSService:
         ctx: RequestContext,
         recursive: bool = False,
         wait: bool = False,
-        timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        async def execute() -> Optional[Dict[str, Any]]:
+            return await self._rm(
+                uri,
+                ctx,
+                recursive=recursive,
+                wait=wait,
+            )
+
+        result, _task_id = await run_tracked_operation(
+            "fs_rm",
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            operation=execute,
+            wait=wait,
+            resource_id=uri,
+        )
+        return result
+
+    async def _rm(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        recursive: bool = False,
+        wait: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Remove resource."""
         viking_fs = self._ensure_initialized()
@@ -473,13 +497,8 @@ class FSService:
             refresh_parent_uri = None
         queue_status = None
         refresh_action: Optional[FreshnessAction] = None
-        request_registered = False
-        telemetry_id = get_current_telemetry().telemetry_id
         try:
             if refresh_parent_uri:
-                if wait and telemetry_id:
-                    get_request_wait_tracker().register_request(telemetry_id)
-                    request_registered = True
                 refresh_action = await self._enqueue_delete_refresh(
                     root_uri=refresh_parent_uri,
                     deleted_uri=uri,
@@ -508,10 +527,9 @@ class FSService:
                     ctx=ctx,
                 )
             if refresh_parent_uri and wait and refresh_action is not FreshnessAction.MARK_PENDING:
-                queue_status = await self._wait_for_refresh(timeout=timeout)
+                queue_status = await self._wait_for_refresh()
         finally:
-            if request_registered:
-                get_request_wait_tracker().cleanup(telemetry_id)
+            pass
         if cleanup_result is not None and isinstance(result, dict):
             result["memory_cleanup"] = cleanup_result
         if refresh_parent_uri and isinstance(result, dict):
@@ -652,14 +670,7 @@ class FSService:
             changes={"deleted": [deleted_uri]},
             generation_trigger="content_delete",
         )
-        if telemetry_id:
-            get_request_wait_tracker().register_semantic_root(telemetry_id, msg.id)
-        try:
-            await semantic_queue.enqueue(msg)
-        except Exception as exc:
-            if telemetry_id:
-                get_request_wait_tracker().mark_semantic_failed(telemetry_id, msg.id, str(exc))
-            raise
+        await semantic_queue.enqueue(msg)
         return decision.action
 
     async def _enqueue_copy_refresh(
@@ -708,30 +719,29 @@ class FSService:
             generation_trigger="content_copy",
             copy_source_uri=source_uri,
         )
-        if telemetry_id:
-            get_request_wait_tracker().register_semantic_root(telemetry_id, msg.id)
-        try:
-            await semantic_queue.enqueue(msg)
-        except Exception as exc:
-            if telemetry_id:
-                get_request_wait_tracker().mark_semantic_failed(telemetry_id, msg.id, str(exc))
-            raise
+        await semantic_queue.enqueue(msg)
         return "queued"
 
-    async def _wait_for_refresh(self, *, timeout: Optional[float]) -> Dict[str, Any]:
-        telemetry_id = get_current_telemetry().telemetry_id
-        if telemetry_id:
-            try:
-                await get_request_wait_tracker().wait_for_request(telemetry_id, timeout=timeout)
-            except TimeoutError as exc:
-                raise DeadlineExceededError("queue processing", timeout) from exc
-            return get_request_wait_tracker().build_queue_status(telemetry_id)
+    async def _wait_for_refresh(self) -> Dict[str, Any]:
+        context = get_task_context()
+        if context is None:
+            raise RuntimeError("TaskContext is required for request-scoped queue waiting")
+        work_ids = get_enqueued_work_ids()
+        tracker = get_task_tracker()
         try:
-            return build_queue_status_payload(
-                await get_queue_manager().wait_complete(timeout=timeout)
-            )
-        except TimeoutError as exc:
-            raise DeadlineExceededError("queue processing", timeout) from exc
+            if context.work_id is None:
+                await tracker.wait_for_task_work(context.task_id, timeout=None)
+            elif work_ids:
+                await tracker.wait_for_work(
+                    context.task_id,
+                    work_ids,
+                    timeout=None,
+                )
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            raise DeadlineExceededError("queue processing", None) from exc
+        return tracker.build_queue_status(
+            context.task_id, work_ids if context.work_id is not None else None
+        )
 
     async def cp(
         self,
@@ -1062,16 +1072,6 @@ class FSService:
         viking_fs = self._ensure_initialized()
         await viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
 
-    async def system_sync_status(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
-        """Return multi-write sync status for one Viking URI subtree."""
-        viking_fs = self._ensure_initialized()
-        return await viking_fs.system_sync_status(uri, ctx=ctx)
-
-    async def system_sync_retry(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
-        """Retry multi-write sync work for one Viking URI subtree."""
-        viking_fs = self._ensure_initialized()
-        return await viking_fs.system_sync_retry(uri, ctx=ctx)
-
     async def read(self, uri: str, ctx: RequestContext, offset: int = 0, limit: int = -1) -> str:
         """Read file content. Accepts a Viking URI or a 32-char hex vector record id."""
         viking_fs = self._ensure_initialized()
@@ -1229,13 +1229,12 @@ class FSService:
         ctx: RequestContext,
         mode: str = "replace",
         wait: bool = False,
-        timeout: Optional[float] = None,
         processing_mode: str = "semantic_and_vectors",
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
-        """Write to an existing file and refresh semantics/vectors."""
+        """Create or update a file and refresh semantics/vectors."""
         viking_fs = self._ensure_initialized()
         coordinator = ContentWriteCoordinator(viking_fs=viking_fs, vikingdb=self._vikingdb)
         return await coordinator.write(
@@ -1244,7 +1243,6 @@ class FSService:
             ctx=ctx,
             mode=mode,
             wait=wait,
-            timeout=timeout,
             processing_mode=processing_mode,
             tags=tags,
             tag_mode=tag_mode,
@@ -1258,7 +1256,8 @@ class FSService:
         operations: list[dict[str, Any]],
         ctx: RequestContext,
         wait: bool = True,
-        timeout: Optional[float] = None,
+        skip_conflicts: bool = False,
+        processing_mode: str = "semantic_and_vectors",
     ) -> Dict[str, Any]:
         """Apply multiple file writes and aggregate downstream refresh."""
         viking_fs = self._ensure_initialized()
@@ -1268,7 +1267,8 @@ class FSService:
             operations=operations,
             ctx=ctx,
             wait=wait,
-            timeout=timeout,
+            skip_conflicts=skip_conflicts,
+            processing_mode=processing_mode,
         )
 
     async def set_tags(
