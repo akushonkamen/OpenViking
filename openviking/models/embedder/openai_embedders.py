@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """OpenAI Embedder Implementation"""
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, cast
 
 import httpx
 import openai
@@ -324,9 +324,8 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
         if isinstance(text, list) and all(isinstance(item, str) for item in text):
             if self.max_input_tokens is None:
                 return text
-            # mypy cannot narrow via ``all(isinstance(...))``; rebind as strings.
-            text_items: List[str] = [item for item in text if isinstance(item, str)]
-            return [truncate_embedding_input(item, self.max_input_tokens) for item in text_items]
+            text = cast(List[str], text)
+            return [truncate_embedding_input(item, self.max_input_tokens) for item in text]
         return self.prepare_embedding_input(text)
 
     def _build_kwargs(
