@@ -11,18 +11,15 @@ from openviking.observability.context import (
 )
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_tracker import get_task_tracker
-from openviking.service.task_work_index import bind_task_context
+from openviking.service.task_work_index import bind_task_context_from_message
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.session_commit_msg import SessionCommitMsg
 from openviking.telemetry.span_models import create_root_span_attributes
 from openviking_cli.session.user_id import UserIdentifier
-from openviking_cli.utils.logger import get_logger
 
 if TYPE_CHECKING:
     from openviking.service.session_service import SessionService
-
-logger = get_logger(__name__)
 
 
 class SessionCommitProcessor(DequeueHandlerBase):
@@ -49,6 +46,10 @@ class SessionCommitProcessor(DequeueHandlerBase):
         # token events are attributed to the committing account/user rather than
         # "__unknown__" (mirrors SemanticProcessor.on_dequeue). Restore the
         # worker's previous context when processing finishes.
+        with bind_task_context_from_message(msg.to_dict()):
+            return await self._process_bound(msg, ctx)
+
+    async def _process_bound(self, msg: SessionCommitMsg, ctx: RequestContext) -> bool:
         root_attrs = create_root_span_attributes(
             http_method="QUEUE",
             http_route="/queuefs/session_commit",
@@ -82,8 +83,7 @@ class SessionCommitProcessor(DequeueHandlerBase):
                 )
                 return True
             await session.load()
-            with bind_task_context(msg.task_id, ctx.account_id, ctx.user.user_id):
-                processed = await session.resume_queued_commit(msg)
+            processed = await session.resume_queued_commit(msg)
             if not processed:
                 from openviking.storage.queuefs import QueueManager, get_queue_manager
 
@@ -124,36 +124,9 @@ class SessionCommitProcessor(DequeueHandlerBase):
             msg, ctx = self._parse_message(data)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             return ProcessResult.failed(str(exc))
-        try:
-            processed = await self._process(msg, ctx)
-        except Exception as exc:
-            # A crash inside the Phase-2 worker (e.g. a torn read of the live
-            # messages.jsonl raising json.JSONDecodeError from Session.load())
-            # must still settle this delivery and the task record. Letting the
-            # exception escape leaves the delivery unacked, the queue row stuck
-            # in processing, and the task pending until the client times out;
-            # a restart replays the same payload into the same crash.
-            # Mirror the session-missing branch: reuse the Phase-1 task record
-            # (tracker.create is idempotent for an explicit task_id owned by
-            # the same user) and record the real error as a terminal failure.
-            logger.error(
-                "[SessionCommit] Phase-2 worker failed for %s: %s",
-                msg.session_id,
-                exc,
-            )
-            tracker = get_task_tracker()
-            await tracker.create(
-                "session_commit",
-                resource_id=msg.session_id,
-                account_id=ctx.account_id,
-                user_id=ctx.user.user_id,
-                task_id=msg.task_id,
-            )
-            await tracker.fail(
-                msg.task_id,
-                str(exc),
-                account_id=ctx.account_id,
-                user_id=ctx.user.user_id,
-            )
-            return ProcessResult.failed(str(exc))
+        with bind_task_context_from_message(data):
+            try:
+                processed = await self._process(msg, ctx)
+            except Exception as exc:
+                return ProcessResult.failed(str(exc))
         return ProcessResult.success() if processed else ProcessResult.requeued()

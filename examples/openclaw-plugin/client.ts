@@ -207,7 +207,6 @@ export type AddResourceInput = {
   reason?: string;
   instruction?: string;
   wait?: boolean;
-  timeout?: number;
   strict?: boolean;
   ignoreDirs?: string;
   include?: string;
@@ -230,7 +229,6 @@ export type AddSkillInput = {
   path?: string;
   data?: unknown;
   wait?: boolean;
-  timeout?: number;
 };
 
 export type AddSkillResult = {
@@ -241,20 +239,10 @@ export type AddSkillResult = {
   queue_status?: unknown;
 };
 
-const DEFAULT_WAIT_REQUEST_TIMEOUT_MS = 120_000;
 export const DEFAULT_PHASE2_POLL_TIMEOUT_MS = 300_000;
-const WAIT_REQUEST_TIMEOUT_BUFFER_MS = 5_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function resolveWaitRequestTimeoutMs(defaultTimeoutMs: number, waitTimeoutSeconds?: number): number {
-  const requestedMs =
-    typeof waitTimeoutSeconds === "number" && Number.isFinite(waitTimeoutSeconds) && waitTimeoutSeconds > 0
-      ? Math.ceil(waitTimeoutSeconds * 1000) + WAIT_REQUEST_TIMEOUT_BUFFER_MS
-      : DEFAULT_WAIT_REQUEST_TIMEOUT_MS;
-  return Math.max(defaultTimeoutMs, requestedMs);
 }
 
 export class OpenVikingClient {
@@ -379,7 +367,14 @@ export class OpenVikingClient {
         signal: controller.signal,
       });
 
-      const payload = (await response.json().catch(() => ({}))) as {
+      // Only a body that arrived whole but is not JSON falls back to `{}`. A
+      // body cut off by a timeout, reset or early close after the headers
+      // rejects, so a write is not reported as stored and a read is not
+      // reported as empty.
+      const payload = (await response.json().catch((error: unknown) => {
+        if (!(error instanceof SyntaxError)) throw error;
+        return {};
+      })) as {
         status?: string;
         result?: T;
         error?: { code?: string; message?: string; trace_id?: string };
@@ -671,7 +666,6 @@ export class OpenVikingClient {
       reason: input.reason ?? "",
       instruction: input.instruction ?? "",
       wait: input.wait ?? false,
-      timeout: input.timeout,
       strict: input.strict ?? false,
       ignore_dirs: input.ignoreDirs,
       include: input.include,
@@ -682,8 +676,6 @@ export class OpenVikingClient {
     }
 
     let packagedSource: Awaited<ReturnType<ResourcePackager["prepareResourceSource"]>> | undefined;
-    const requestTimeoutMs =
-      input.wait ? resolveWaitRequestTimeoutMs(this.timeoutMs, input.timeout) : undefined;
     try {
       packagedSource = await this.resourcePackager.prepareResourceSource(pathOrUrl);
       if (packagedSource.kind === "remote") {
@@ -697,7 +689,7 @@ export class OpenVikingClient {
       return this.request<AddResourceResult>(
         "/api/v1/resources",
         { method: "POST", body: JSON.stringify(body) },
-        requestTimeoutMs,
+        undefined,
         actorPeerId,
       );
     } finally {
@@ -714,11 +706,8 @@ export class OpenVikingClient {
 
     const body: Record<string, unknown> = {
       wait: input.wait ?? false,
-      timeout: input.timeout,
     };
     let packagedSource: Awaited<ReturnType<ResourcePackager["prepareLocalUploadSource"]>> | undefined;
-    const requestTimeoutMs =
-      input.wait ? resolveWaitRequestTimeoutMs(this.timeoutMs, input.timeout) : undefined;
     try {
       if (hasPath) {
         const skillPath = input.path!.trim();
@@ -733,7 +722,7 @@ export class OpenVikingClient {
       return this.request<AddSkillResult>(
         "/api/v1/skills",
         { method: "POST", body: JSON.stringify(body) },
-        requestTimeoutMs,
+        undefined,
         actorPeerId,
       );
     } finally {
@@ -843,7 +832,6 @@ export class OpenVikingClient {
     options?: {
       wait?: boolean;
       enableWorkingMemory?: boolean;
-      timeoutMs?: number;
       /**
        * WM v2: number of most-recent messages to keep live after commit.
        * Forwarded as `keep_recent_count` in the POST body. 0 (default)
@@ -900,7 +888,7 @@ export class OpenVikingClient {
     }
 
     // Client-side poll until Phase 2 finishes
-    const deadline = this.now() + (options.timeoutMs ?? DEFAULT_PHASE2_POLL_TIMEOUT_MS);
+    const deadline = this.now() + DEFAULT_PHASE2_POLL_TIMEOUT_MS;
     const pollInterval = 500;
     while (this.now() < deadline) {
       await this.sleep(pollInterval);

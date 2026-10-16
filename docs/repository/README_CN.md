@@ -159,7 +159,7 @@ uv tool install openviking --upgrade && openviking-server init
 <details>
 <summary><strong>使用 OpenViking Service（火山引擎托管）</strong></summary>
 
-同一个 OpenViking 服务，由火山引擎替你运行。前 50 个文件免费。在[火山引擎产品页](https://www.volcengine.com/product/openviking-service)开通后，到控制台的「用户管理 → API Key」创建一个 API key。服务地址是 `https://api.vikingdb.cn-beijing.volces.com/openviking`，接入 agent 时要用到它和 API key。
+同一个 OpenViking 服务，由火山引擎替你运行。前 50 个文件免费。在[火山引擎产品页](https://www.volcengine.com/product/openviking-service?utm_source=github&utm_medium=referral&utm_campaign=readme)开通后，到控制台的「用户管理 → API Key」创建一个 API key。服务地址是 `https://api.vikingdb.cn-beijing.volces.com/openviking`，接入 agent 时要用到它和 API key。
 
 </details>
 
@@ -311,6 +311,8 @@ Codex 首次启动会停在 `Hooks need review`，选 `Trust all and continue`�
 
 详细接入方式请参考 [Integrations](https://openviking.ai/integrations)。
 
+框架应用请参考 [LangChain/LangGraph 和 Microsoft Agent Framework 集成包](../../integrations/frameworks/README.md)，其中也介绍了如何添加其他框架适配器。
+
 ## 桌面客户端（Beta）
 
 桌面客户端是面向 macOS 和 Windows x64 的控制台（Beta），用于配置支持的本地 Agent 接入、查看会话中的召回与捕获事件，并将本地记忆和技能同步到 OpenViking。
@@ -348,7 +350,7 @@ ov chat   # 在另一个终端运行
 <img src="../images/commercial-saas.png" alt="商业化 SaaS 版" width="100%" />
 
 <h3>☁️ 商业化 SaaS 版</h3>
-<p>由<a href="https://www.volcengine.com/product/openviking-service">火山引擎</a>托管和运维，提供个人版、企业版，以及开源部署的迁移工具。套餐与额度见<a href="https://docs.volcengine.com/docs/84313/2374478">服务文档</a>。中国以外地区的托管服务计划在 <a href="https://www.byteplus.com">BytePlus</a> 上线。</p>
+<p>由<a href="https://www.volcengine.com/product/openviking-service?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=readme">火山引擎</a>托管和运维，提供个人版、企业版，以及开源部署的迁移工具。套餐与额度见<a href="https://docs.volcengine.com/docs/84313/2374478">服务文档</a>。中国以外地区的托管服务计划在 <a href="https://www.byteplus.com">BytePlus</a> 上线。</p>
 
 </td>
 <td width="50%" valign="top">
@@ -417,4 +419,5 @@ OpenViking 各组件采用不同的许可证：
 - **主项目**：AGPLv3——详见 [LICENSE](../../LICENSE)
 - **crates/ov\_cli**：Apache 2.0——详见 [LICENSE](../../crates/LICENSE)
 - **examples**：Apache 2.0——详见 [LICENSE](../../examples/LICENSE)。`examples/hermes-plugin` 中的 Hermes 插件保留其 [MIT 许可证](../../examples/hermes-plugin/LICENSE)。
+- **integrations/frameworks**：适配器的包元数据和源码声明 AGPLv3，详见各包的 `LICENSE`；可运行示例保留 Apache 2.0，详见各包的 `examples/LICENSE`。
 - **third\_party**：各三方项目保留其原有协议

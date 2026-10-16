@@ -10,6 +10,7 @@ from openviking.service.task_work_index import (
     bind_task_context,
     extract_task_metadata,
     prepare_task_payload,
+    record_enqueued_work,
 )
 from openviking.storage.queuefs.process_result import ProcessOutcome, ProcessResult
 from openviking.storage.queuefs.queue_middleware import (
@@ -35,15 +36,38 @@ class TaskWorkQueueMiddleware(QueueMiddleware):
         if not isinstance(ctx.payload, dict):
             return await call_next(ctx)
         ctx.payload, metadata = prepare_task_payload(ctx.payload)
+        ctx.work_id = metadata.work_id if metadata is not None else None
         if not self._index.register(ctx.queue, metadata):
             raise TaskWorkRejected(
                 f"Task {metadata.task_id} is cancelling; rejected work for {ctx.queue}"
             )
         try:
-            return await call_next(ctx)
-        finally:
-            if metadata is not None and not ctx.committed:
+            result = await call_next(ctx)
+        except asyncio.CancelledError:
+            if metadata is not None:
+                if ctx.committed:
+                    record_enqueued_work(ctx.queue, metadata.work_id)
+                else:
+                    await self._index.discard(ctx.queue, metadata)
+            raise
+        except BaseException as exc:
+            if metadata is not None:
+                if ctx.committed:
+                    record_enqueued_work(ctx.queue, metadata.work_id)
+                else:
+                    await self._index.fail_enqueue(
+                        ctx.queue,
+                        metadata,
+                        str(exc),
+                    )
+                    record_enqueued_work(ctx.queue, metadata.work_id)
+            raise
+        if metadata is not None:
+            if ctx.committed:
+                record_enqueued_work(ctx.queue, metadata.work_id)
+            else:
                 await self._index.discard(ctx.queue, metadata)
+        return result
 
     async def process(self, ctx: ProcessContext, call_next: ProcessNext) -> ProcessResult:
         metadata = extract_task_metadata(ctx.message)
@@ -51,30 +75,53 @@ class TaskWorkQueueMiddleware(QueueMiddleware):
             return await call_next(ctx)
 
         active_task = asyncio.current_task()
-        with bind_task_context(metadata.task_id, metadata.account_id, metadata.user_id):
+        enqueued_work = []
+        with bind_task_context(
+            metadata.task_id,
+            metadata.account_id,
+            metadata.user_id,
+            enqueued_work=enqueued_work,
+            work_id=metadata.work_id,
+        ):
             if self._index.cancellation_requested(metadata.task_id):
                 result = await ctx.cancel()
-                if result.outcome is ProcessOutcome.FAILED:
-                    self._index.record_failure(metadata.task_id, result.error)
+                self._record_result(metadata, result)
                 return result
             if active_task is not None:
-                self._index.register_active(metadata.task_id, active_task)
+                self._index.register_active(
+                    metadata.task_id,
+                    active_task,
+                    work_id=metadata.work_id,
+                )
             try:
                 result = await call_next(ctx)
             except asyncio.CancelledError:
-                if self._index.cancellation_requested(metadata.task_id):
-                    # Handler unwinding must finish before this delivery is settled.
-                    return ProcessResult.cancelled()
-                raise
+                if not self._index.cancellation_requested(metadata.task_id):
+                    raise
+                # Handler unwinding finished; settle user cancellation before ACK.
+                result = ProcessResult.cancelled()
             except Exception as exc:
                 self._index.record_failure(metadata.task_id, str(exc))
                 raise
             finally:
                 if active_task is not None:
                     self._index.unregister_active(metadata.task_id, active_task)
-            if result.outcome is ProcessOutcome.FAILED:
-                self._index.record_failure(metadata.task_id, result.error)
+            self._record_result(metadata, result)
             return result
+
+    def _record_result(self, metadata, result: ProcessResult) -> None:
+        outcome = {
+            ProcessOutcome.SUCCESS: "completed",
+            ProcessOutcome.FAILED: "failed",
+            ProcessOutcome.REQUEUED: "requeued",
+            ProcessOutcome.CANCELLED: "cancelled",
+        }[result.outcome]
+        self._index.record_result(
+            metadata,
+            outcome,
+            error=result.error,
+            errors=result.errors,
+        )
 
     async def ack(self, ctx: AckContext, call_next: AckNext) -> None:
         prepared = None

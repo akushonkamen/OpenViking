@@ -22,7 +22,6 @@ pub async fn handle_add_resource(
     reason: String,
     instruction: String,
     wait: bool,
-    timeout: Option<f64>,
     strict_mode: bool,
     ignore_dirs: Option<String>,
     include: Option<String>,
@@ -86,11 +85,6 @@ pub async fn handle_add_resource(
         reject_manifest_run_keys(args)?;
     }
 
-    let effective_timeout = if wait {
-        timeout.unwrap_or(60.0).max(ctx.config.timeout)
-    } else {
-        ctx.config.timeout
-    };
     let auth = ctx.config.effective_auth(ctx.sudo);
     let client = client::HttpClient::new(
         &ctx.config.url,
@@ -98,7 +92,7 @@ pub async fn handle_add_resource(
         auth.account,
         auth.user,
         ctx.config.effective_actor_peer_id(),
-        effective_timeout,
+        ctx.config.timeout,
         ctx.profile.unwrap_or(ctx.config.profile),
         ctx.config.effective_extra_headers(),
     )
@@ -113,7 +107,6 @@ pub async fn handle_add_resource(
         reason,
         instruction,
         wait,
-        timeout,
         strict,
         effective_ignore_dirs,
         effective_include,
@@ -415,13 +408,13 @@ pub async fn handle_restore(
     .await
 }
 
-use crate::{SystemBackendCommands, SystemCommands};
+use crate::SystemCommands;
 
 pub async fn handle_system(cmd: SystemCommands, ctx: CliContext) -> Result<()> {
     let client = ctx.get_client();
     match cmd {
-        SystemCommands::Wait { timeout } => {
-            commands::system::wait(&client, timeout, ctx.output_format, ctx.compact).await
+        SystemCommands::Wait => {
+            commands::system::wait(&client, ctx.output_format, ctx.compact).await
         }
         SystemCommands::Status => {
             commands::system::status(&client, ctx.output_format, ctx.compact).await
@@ -440,16 +433,6 @@ pub async fn handle_system(cmd: SystemCommands, ctx: CliContext) -> Result<()> {
             commands::system::consistency(&client, &uri, ctx.output_format, ctx.compact).await
         }
         SystemCommands::Crypto { action } => commands::crypto::handle_crypto(action).await,
-        SystemCommands::Backend { action } => match action {
-            SystemBackendCommands::SyncStatus { uri } => {
-                commands::system::backend_sync_status(&client, &uri, ctx.output_format, ctx.compact)
-                    .await
-            }
-            SystemBackendCommands::SyncRetry { uri } => {
-                commands::system::backend_sync_retry(&client, &uri, ctx.output_format, ctx.compact)
-                    .await
-            }
-        },
     }
 }
 
@@ -1375,9 +1358,10 @@ fn validating_target_config(language: Language) -> &'static str {
     }
 }
 
-pub async fn handle_read(uri: String, ctx: CliContext) -> Result<()> {
+/// Read a URI with a zero-based offset and line count; -1 reads through EOF.
+pub async fn handle_read(uri: String, offset: i64, limit: i64, ctx: CliContext) -> Result<()> {
     let client = ctx.get_client();
-    commands::content::read(&client, &uri, ctx.output_format, ctx.compact).await
+    commands::content::read(&client, &uri, offset, limit, ctx.output_format, ctx.compact).await
 }
 
 pub async fn handle_abstract(uri: String, ctx: CliContext) -> Result<()> {
@@ -1396,7 +1380,6 @@ pub async fn handle_write(
     from_file: Option<String>,
     mode: String,
     wait: bool,
-    timeout: Option<f64>,
     processing_mode: String,
     tags: Vec<String>,
     tag_mode: String,
@@ -1420,7 +1403,6 @@ pub async fn handle_write(
         &payload,
         &mode,
         wait,
-        timeout,
         &processing_mode,
         tags,
         &tag_mode,
@@ -1561,6 +1543,7 @@ pub async fn handle_search(
     uri: String,
     image: Option<String>,
     search_type: String,
+    mode: String,
     session_id: Option<String>,
     node_limit: i32,
     threshold: Option<f64>,
@@ -1584,9 +1567,13 @@ pub async fn handle_search(
             "--image is not supported with --search-type keywords.".to_string(),
         ));
     }
+    validate_search_mode_options(&mode, &uri, read_content)?;
     let mut params = vec![format!("--uri={}", uri), format!("-n {}", node_limit)];
     if search_type != "semantic" {
         params.push(format!("--search-type {}", search_type));
+    }
+    if mode != "list" {
+        params.push(format!("--mode {}", mode));
     }
     if let Some(ref img) = image {
         params.push(format!("--image {}", img));
@@ -1628,6 +1615,7 @@ pub async fn handle_search(
         &uri,
         image,
         &search_type,
+        &mode,
         session_id,
         node_limit,
         threshold,
@@ -1643,6 +1631,24 @@ pub async fn handle_search(
         ctx.compact,
     )
     .await
+}
+
+fn validate_search_mode_options(mode: &str, uri: &str, read_content: bool) -> Result<()> {
+    if mode == "context" {
+        if !uri.is_empty() {
+            return Err(Error::Client(
+                "--uri is not supported with --mode context. Remove --uri or use --mode list."
+                    .to_string(),
+            ));
+        }
+        if read_content {
+            return Err(Error::Client(
+                "--read-content is not supported with --mode context; context assembly already includes content. Remove --read-content or use --mode list."
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn append_time_filter_params(
@@ -1886,7 +1892,6 @@ pub async fn handle_rm(
     uri: String,
     recursive: bool,
     wait: bool,
-    timeout: Option<f64>,
     ctx: CliContext,
 ) -> Result<()> {
     let client = ctx.get_client();
@@ -1895,7 +1900,6 @@ pub async fn handle_rm(
         &uri,
         recursive,
         wait,
-        timeout,
         ctx.output_format,
         ctx.compact,
     )

@@ -110,9 +110,9 @@ export const sections: DocSection[] = [
         p('agent-integrations/18-plugin-development'),
         p('guides/working-memory-default-off')
       ]),
-      g('Context Gateway', '上下文网关', [
-        p('guides/15-context-gateway'),
-        p('guides/22-context-gateway-operations')
+      g('OpenViking Gateway', 'OpenViking 网关', [
+        p('guides/15-gateway'),
+        p('guides/22-gateway-operations')
       ]),
       g('VikingBot', 'VikingBot', [
         p('guides/17-vikingbot'),
@@ -129,6 +129,7 @@ export const sections: DocSection[] = [
         p('workflows/01-overview')
       ]),
       g('Manage context', '组织与维护上下文', [
+        p('guides/23-data-organize'),
         p('guides/18-openviking-assets'),
         p('guides/09-ovpack'),
         p('guides/15-snapshot'),
@@ -215,7 +216,7 @@ export const sections: DocSection[] = [
       ]),
       g('Administration and operations APIs', '管理与运维 API', [
         p('api/08-admin'),
-        p('api/25-context-gateway'),
+        p('api/25-gateway'),
         p('api/12-acl'),
         p('api/10-privacy'),
         p('api/07-system'),

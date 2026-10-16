@@ -1743,7 +1743,7 @@ async def test_queue_enqueue_failure_marks_archive_failed_and_keeps_raw_durable(
     )
 
     with pytest.raises(RuntimeError, match="queue unavailable"):
-        await session.commit_async()
+        await session.commit_async(record_idle_commit_success=True)
 
     states = await session._archives.scan_states()
     context = await session.get_session_context()
@@ -1761,6 +1761,7 @@ async def test_queue_enqueue_failure_marks_archive_failed_and_keeps_raw_durable(
     assert [message.content for message in raw] == ["do not lose me"]
     assert [message["parts"][0]["text"] for message in context["messages"]] == ["do not lose me"]
     assert context["stats"]["failedArchives"] == 1
+    assert session.meta.last_idle_commit_accepted_at == ""
 
 
 async def test_phase1_root_rewrite_failure_marks_orphan_archive_failed(

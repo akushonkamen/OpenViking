@@ -107,14 +107,86 @@ async def test_enqueue_registers_before_write_and_ack_finalizes_before_delete(tr
     assert not index.has_work("task-1")
 
 
-@pytest.mark.parametrize("failure", [OSError("write failed"), asyncio.CancelledError()])
-async def test_enqueue_failure_discards_registered_work(tracked_queue, failure):
+async def test_enqueue_keeps_content_owner_separate_from_task_owner(tracked_queue):
+    queue, _, transport, _, _ = tracked_queue
+    payload = {
+        "task_id": "task-1",
+        "account_id": "account",
+        "user_id": "content-owner",
+        "task_account_id": "business-account",
+        "task_user_id": "business-user",
+        "payload": {
+            "context_data": {
+                "account_id": "account",
+                "owner_user_id": "content-owner",
+            }
+        },
+    }
+
+    with bind_task_context("task-1", "account", "task-owner"):
+        await queue.enqueue(payload)
+
+    persisted = json.loads(transport.write.await_args.args[1])
+    assert persisted["user_id"] == "content-owner"
+    assert persisted["task_account_id"] == "business-account"
+    assert persisted["task_user_id"] == "business-user"
+    assert persisted["payload"]["context_data"]["owner_user_id"] == "content-owner"
+    assert persisted["_task_account_id"] == "account"
+    assert persisted["_task_user_id"] == "task-owner"
+    assert extract_task_metadata(persisted).user_id == "task-owner"
+
+
+async def test_enqueue_does_not_stamp_task_owner_without_authoritative_context(tracked_queue):
+    queue, _, transport, _, _ = tracked_queue
+
+    with bind_task_context("task-1", "", ""):
+        await queue.enqueue(
+            {
+                "task_id": "task-1",
+                "account_id": "account",
+                "user_id": "content-owner",
+            }
+        )
+
+    persisted = json.loads(transport.write.await_args.args[1])
+    assert persisted["account_id"] == "account"
+    assert persisted["user_id"] == "content-owner"
+    assert "_task_account_id" not in persisted
+    assert "_task_user_id" not in persisted
+
+
+async def test_enqueue_failure_records_failed_work(tracked_queue):
     queue, index, transport, finalize, _ = tracked_queue
-    transport.write.side_effect = failure
-    with bind_task_context("task-1", "account", "user"):
-        with pytest.raises(type(failure)):
+    transport.write.side_effect = OSError("write failed")
+    enqueued_work = []
+    with bind_task_context(
+        "task-1",
+        "account",
+        "user",
+        enqueued_work=enqueued_work,
+    ):
+        with pytest.raises(OSError, match="write failed"):
             await queue.enqueue({})
     assert not index.has_work("task-1")
+    payload = json.loads(transport.write.await_args.args[1])
+    assert enqueued_work == [("Test", payload["_task_work_id"])]
+    assert index.queue_status("task-1")["Test"] == {
+        "processed": 0,
+        "requeue_count": 0,
+        "error_count": 1,
+        "errors": [{"message": "write failed"}],
+    }
+    finalize.assert_awaited_once()
+
+
+async def test_cancelled_enqueue_discards_registered_work(tracked_queue):
+    queue, index, transport, finalize, _ = tracked_queue
+    transport.write.side_effect = asyncio.CancelledError()
+    with bind_task_context("task-1", "account", "user"):
+        with pytest.raises(asyncio.CancelledError):
+            await queue.enqueue({})
+    assert not index.has_work("task-1")
+    assert index.queue_status("task-1") == {}
     finalize.assert_awaited_once()
 
 
@@ -252,7 +324,8 @@ async def test_process_result_tracks_children_and_errors(tracked_queue):
 
     class Handler(DequeueHandlerBase):
         async def on_dequeue(self, data):
-            contexts.append(get_task_context())
+            with bind_task_context("task-1", "account", "user"):
+                contexts.append(get_task_context())
             correlations.append(log_correlation(telemetry_id="tm-1", message_id="semantic-1"))
             await queue.enqueue({"child": True})
             return ProcessResult.failed("failed work")
@@ -260,6 +333,7 @@ async def test_process_result_tracks_children_and_errors(tracked_queue):
     queue.set_dequeue_handler(Handler())
     assert (await queue.process_dequeued(message)).outcome is ProcessOutcome.FAILED
     assert contexts[0].task_id == "task-1"
+    assert contexts[0].work_id == extract_task_metadata(message).work_id
     assert correlations == ["task_id=task-1 telemetry_id=tm-1 message_id=semantic-1"]
     assert get_task_context() is None
     assert index.failure("task-1") == "failed work"
@@ -347,6 +421,7 @@ async def test_cancel_before_handler_uses_legacy_discard_callback(tracked_queue)
 async def test_active_cancellation_distinguishes_user_from_shutdown(tracked_queue, user_cancel):
     queue, index, transport, _, cancelled = tracked_queue
     message = await enqueue_task(queue, transport)
+    metadata = extract_task_metadata(message)
     started = asyncio.Event()
 
     class Handler(DequeueHandlerBase):
@@ -363,6 +438,7 @@ async def test_active_cancellation_distinguishes_user_from_shutdown(tracked_queu
             index.cancel_active("task-1")
             result = await asyncio.wait_for(running, timeout=1)
             assert result.outcome is ProcessOutcome.CANCELLED
+            await index.wait_for_work("task-1", [metadata.work_id], timeout=0.1)
             await queue.ack("message-1", message)
             assert not index.has_work("task-1")
             assert (await queue.get_status()).processed == 1

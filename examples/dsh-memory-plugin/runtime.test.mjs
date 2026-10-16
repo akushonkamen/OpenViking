@@ -127,6 +127,38 @@ test("a retryable threshold commit failure is queued", async () => {
   ]);
 });
 
+test("compaction/start commits below the token threshold without reading session metadata", async () => {
+  const pendingDir = await mkdtemp(join(tmpdir(), "dsh-memory-compaction-"));
+  tempDirs.push(pendingDir);
+  process.env.OPENVIKING_PENDING_DIR = pendingDir;
+  let getSessionCalls = 0;
+  let commitCalls = 0;
+  const runtime = new OpenVikingRuntime({
+    async getSession() {
+      getSessionCalls += 1;
+      return { pending_tokens: 5 };
+    },
+    async commitSession() {
+      commitCalls += 1;
+      return { ok: true };
+    },
+  }, config(), { debug() {} });
+  const session = { id: "compaction-commit", header: { cwd: "/workspace" } };
+  runtime.stateFor(session).ready = true;
+
+  runtime.maybeCommit(session, { type: "compaction/start" });
+  await runtime.flush(session);
+
+  assert.equal(getSessionCalls, 0);
+  assert.equal(commitCalls, 1);
+
+  runtime.maybeCommit(session, { type: "compaction/end" });
+  await runtime.flush(session);
+
+  assert.equal(getSessionCalls, 0);
+  assert.equal(commitCalls, 1);
+});
+
 test("once a write is queued, later messages and the final commit stay ordered on disk", async () => {
   const pendingDir = await mkdtemp(join(tmpdir(), "dsh-memory-order-"));
   tempDirs.push(pendingDir);
@@ -164,11 +196,11 @@ test("once a write is queued, later messages and the final commit stay ordered o
   ]);
   assert.deepEqual(
     pending.map(item => (
-      item.entry.payload.parts?.[0]?.text
-      || item.entry.payload.content
-      || item.entry.payload.keep_recent_count
+      item.entry.type === "commitSession"
+        ? item.entry.payload
+        : item.entry.payload.parts?.[0]?.text || item.entry.payload.content
     )),
-    ["First queued message.", "Second queued message.", 10],
+    ["First queued message.", "Second queued message.", { keep_recent_count: 0 }],
   );
   assert.deepEqual(
     pending.map(item => item.entry.createdAt),

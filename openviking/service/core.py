@@ -60,6 +60,7 @@ logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from openviking.config.vlm import VLMResolver
+    from openviking.scheduling.expiry.runtime import ExpiryRuntime
     from openviking.session.compressor_v3 import SessionCompressorV3
 
 
@@ -103,6 +104,7 @@ class OpenVikingService:
         self._uri_mutation_coordinator = UriMutationCoordinator()
         self._watch_scheduler: Optional[WatchScheduler] = None
         self._session_auto_commit_scheduler: Optional[SessionAutoCommitScheduler] = None
+        self._expiry_runtime: Optional["ExpiryRuntime"] = None
         self._encryptor: Optional[Any] = None
         self._privacy_config_service: Optional[UserPrivacyConfigService] = None
         self._runtime_config_manager: Optional[Any] = None
@@ -577,7 +579,15 @@ class OpenVikingService:
         except Exception:
             session_auto_commit_config = SessionAutoCommitConfig()
         self._session_service.set_session_auto_commit_config(session_auto_commit_config)
-        if session_auto_commit_config.enabled:
+        expiry_config = get_openviking_config().expiry
+        session_expiry_enabled = (
+            session_auto_commit_config.enabled
+            and getattr(session_auto_commit_config, "idle_backend", "local") == "redis"
+        )
+        if (
+            session_auto_commit_config.enabled
+            and getattr(session_auto_commit_config, "idle_backend", "local") == "local"
+        ):
             self._session_auto_commit_scheduler = SessionAutoCommitScheduler(
                 self._session_service,
                 session_auto_commit_config,
@@ -649,6 +659,29 @@ class OpenVikingService:
             self._queue_manager.start()
             logger.info("QueueManager workers started")
 
+        if session_expiry_enabled:
+            from openviking.scheduling.expiry.runtime import ExpiryRuntime, ExpiryRuntimeRoles
+
+            self._expiry_runtime = ExpiryRuntime(
+                expiry_config,
+                roles=ExpiryRuntimeRoles(
+                    report=True,
+                    publish=not expiry_config.publisher_separate_process,
+                    consume=True,
+                ),
+            )
+            try:
+                self._session_service.configure_expiry(
+                    self._expiry_runtime.scheduler,
+                    consumer_concurrency=expiry_config.session_consumer_concurrency,
+                )
+                await self._expiry_runtime.start_storage()
+                await self._expiry_runtime.start_roles()
+            except Exception:
+                await self._stop_expiry()
+                raise
+            logger.info("Expiry roles started")
+
         # Preflight the MinerU endpoint when it will be used, so endpoint
         # misconfiguration or a stopped service surfaces now instead of on the
         # first PDF import. Required for strategy="mineru"; advisory for "auto".
@@ -663,6 +696,7 @@ class OpenVikingService:
                 logger.info("MinerU preflight passed: %s", pdf_config.mineru_endpoint)
             except RuntimeError as exc:
                 if pdf_config.strategy == "mineru":
+                    await self._stop_expiry()
                     raise
                 logger.warning(
                     "MinerU preflight failed (fallback will retry on first parse): %s", exc
@@ -673,10 +707,31 @@ class OpenVikingService:
         self._initialized = True
         logger.info("OpenVikingService initialized")
 
+    async def _stop_expiry(self) -> None:
+        """Stop expiry work before releasing dependencies used by callbacks."""
+        runtime = self._expiry_runtime
+        if runtime is None:
+            self._session_service.set_session_expiry_adapter(None)
+            return
+        try:
+            await runtime.close()
+        except Exception as exc:
+            logger.exception("Expiry shutdown failed")
+            if getattr(exc, "code", None) == "shard_not_stopped":
+                # Retain the runtime and leave QueueFS/AGFS open for still-running
+                # callbacks. The caller can retry close after they terminate.
+                raise
+        else:
+            self._session_service.set_session_expiry_adapter(None)
+            self._expiry_runtime = None
+            logger.info("Expiry stopped")
+
     async def close(self) -> None:
         """Close OpenViking and release resources."""
         await self._resource_service.close_background_tasks()
         vlm_resolver = getattr(self, "_vlm_resolver", None)
+
+        await self._stop_expiry()
 
         if self._runtime_config_manager:
             await self._runtime_config_manager.stop_refresh_loop()

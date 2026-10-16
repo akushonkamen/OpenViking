@@ -13,14 +13,10 @@ from openviking.concurrency import AsyncSemaphore
 from openviking.config.scope import ScopeKind
 from openviking.config.vector import AccountVectorConfigResolver, VectorRuntimeSettings
 from openviking.models.embedder.base import EmbedderBase
+from openviking.models.embedder.retry_embedder import RetryEmbedder
 from openviking.models.vlm.token_usage import TokenUsageTracker
 from openviking.service.task_tracker_concurrency import KeyedAsyncLockPool
 from openviking.utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
-from openviking.utils.model_retry import (
-    ERROR_CLASS_AUTH,
-    ERROR_CLASS_INPUT_TOO_LARGE,
-    classify_api_error,
-)
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -113,6 +109,8 @@ def _bind_account_state(
         child = getattr(embedder, name, None)
         if child is not None:
             children.append(child)
+    if isinstance(embedder, RetryEmbedder):
+        children.append(embedder.inner)
     for child in children:
         _bind_account_state(child, semaphore, tracker, account_id)
 
@@ -256,8 +254,7 @@ class AccountEmbeddingProvider:
                         f"got {len(result.dense_vector)}"
                     )
         except Exception as exc:
-            if classify_api_error(exc) not in {ERROR_CLASS_AUTH, ERROR_CLASS_INPUT_TOO_LARGE}:
-                resource.breaker.record_failure(exc)
+            resource.breaker.record_failure(exc)
             raise
         resource.breaker.record_success()
         return result

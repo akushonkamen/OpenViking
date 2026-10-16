@@ -100,25 +100,34 @@ class EmbeddingMsg:
     payload: EmbeddingPayload
     id: str = field(default_factory=lambda: str(uuid4()))
     telemetry_id: str = ""
+    task_id: str = ""
+    _task_work_id: str = ""
     queue_enqueued_at: float = 0.0
+    failure_requeue_count: int = 0
 
     def __init__(
         self,
         message: Optional[EmbeddingInput] = None,
         context_data: Optional[Dict[str, Any]] = None,
         telemetry_id: str = "",
+        task_id: str = "",
+        _task_work_id: str = "",
         action: IndexAction | str = IndexAction.UPSERT,
         record_ids: Optional[List[str]] = None,
         update_fields: Optional[Dict[str, Any]] = None,
         field_modes: Optional[Dict[str, str]] = None,
         initial_fields: Optional[Dict[str, Any]] = None,
         queue_enqueued_at: float = 0.0,
+        failure_requeue_count: int = 0,
         *,
         payload: EmbeddingPayload | None = None,
     ) -> None:
         self.id = str(uuid4())
         self.telemetry_id = telemetry_id
+        self.task_id = task_id
+        self._task_work_id = _task_work_id
         self.queue_enqueued_at = max(float(queue_enqueued_at or 0.0), 0.0)
+        self.failure_requeue_count = max(int(failure_requeue_count or 0), 0)
         self.action = IndexAction(action)
         if payload is not None:
             if any(
@@ -322,7 +331,10 @@ class EmbeddingMsg:
         return {
             "id": self.id,
             "telemetry_id": self.telemetry_id,
+            "task_id": self.task_id,
+            "_task_work_id": self._task_work_id,
             "queue_enqueued_at": self.queue_enqueued_at,
+            "failure_requeue_count": self.failure_requeue_count,
             "action": self.action.value,
             "payload": self.payload.to_dict(),
         }
@@ -387,19 +399,25 @@ class EmbeddingMsg:
                 action=action,
                 payload=payload,
                 telemetry_id=str(data.get("telemetry_id") or ""),
+                task_id=str(data.get("task_id") or ""),
+                _task_work_id=str(data.get("_task_work_id") or ""),
                 queue_enqueued_at=data.get("queue_enqueued_at", 0.0),
+                failure_requeue_count=data.get("failure_requeue_count", 0),
             )
         else:
             obj = cls(
                 message=data.get("message"),
                 context_data=dict(data.get("context_data") or {}),
                 telemetry_id=str(data.get("telemetry_id") or ""),
+                task_id=str(data.get("task_id") or ""),
+                _task_work_id=str(data.get("_task_work_id") or ""),
                 action=action,
                 record_ids=data.get("record_ids"),
                 update_fields=data.get("update_fields"),
                 field_modes=data.get("field_modes"),
                 initial_fields=data.get("initial_fields"),
                 queue_enqueued_at=data.get("queue_enqueued_at", 0.0),
+                failure_requeue_count=data.get("failure_requeue_count", 0),
             )
         obj.id = str(data.get("id") or obj.id)
         return obj
