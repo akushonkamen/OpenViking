@@ -347,6 +347,64 @@ async def test_phase2_defers_live_predecessor_and_skips_missing_queue_work(
     assert not await session._viking_fs.exists(f"{session.uri}/history/archive_001/.failed.json")
 
 
+async def test_legacy_predecessor_without_phase1_metadata_allows_phase2(
+    client,
+):
+    """A pre-Phase-1 archive (only messages.jsonl) must not block its successor.
+
+    Archives created by older OpenViking versions keep their previous
+    processing contract: ``_ensure_phase1_ready()`` treats a missing Phase 1
+    marker as legacy and returns True, so ``_can_run_archive()`` must resolve
+    such a predecessor instead of waiting for a terminal state that no queue
+    work will ever produce.
+    """
+    session = client(session_id="legacy_predecessor_gate_test")
+    await session.ensure_exists()
+    legacy_uri = await _write_archive(
+        session,
+        1,
+        [_text_message("u1", "user", "legacy one")],
+    )
+    await _write_archive(
+        session,
+        2,
+        [_text_message("u2", "user", "archive two")],
+    )
+
+    assert not await session._read_phase1_meta(legacy_uri)
+    assert await session._archives.terminal_state(legacy_uri) == "pending"
+
+    assert await session._can_run_archive(2)
+
+
+async def test_ready_predecessor_with_live_queue_work_still_defers(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="ready_predecessor_gate_defer_test")
+    await session.ensure_exists()
+    await _write_archive(
+        session,
+        1,
+        [_text_message("u1", "user", "pending one")],
+        meta={
+            "phase1": {
+                "status": "ready",
+                "queue_message": {"task_id": "task-1"},
+            }
+        },
+    )
+    await _write_archive(
+        session,
+        2,
+        [_text_message("u2", "user", "archive two")],
+    )
+    tracker = get_task_tracker()
+    monkeypatch.setattr(tracker, "has_work", AsyncMock(return_value=True))
+
+    assert not await session._can_run_archive(2)
+
+
 async def test_missing_previous_archive_directory_allows_phase2(
     client,
 ):
