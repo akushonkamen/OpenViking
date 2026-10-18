@@ -57,11 +57,6 @@ logger = get_logger(__name__)
 # must set `vlm.max_tokens` in ov.conf to their own limit to override this default.
 _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS = 32768
 
-# Absolute ceiling for the single budget retry: when a response was cut off by the
-# output-token budget, the one repair attempt may raise the cap up to this bound
-# (never above twice the effective cap, and never above this ceiling).
-_EXTRACTION_MAX_OUTPUT_TOKENS_CEILING = 2 * _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS
-
 
 @dataclass
 class _EventRepairOperations:
@@ -411,16 +406,21 @@ class ExtractLoop:
             parse_error = self._last_parse_error
             # Add format error message if parse failed (max 1 retry). This may raise
             # max_iterations, granting one more attempt after this failure.
+            if failure_kind == "budget_exhausted":
+                # Truncation is not an ordinary format mistake: a same-cap format
+                # retry would only hit the budget again, and replaying the
+                # truncated output just grows the prompt. Fail fast with the
+                # dedicated error recorded by _call_llm().
+                raise RuntimeError(
+                    f"Memory extraction aborted: {parse_error or failure_kind}"
+                )
+
             if self._format_retry_count == 0:
                 self._format_retry_count += 1
                 max_iterations += 1
-                if failure_kind == "budget_exhausted":
-                    retry_reason = "budget_retry"
-                    self._raise_output_budget_for_retry()
-                else:
-                    retry_reason = (
-                        "refusal_text" if failure_kind == "refusal_text" else "format_retry"
-                    )
+                retry_reason = (
+                    "refusal_text" if failure_kind == "refusal_text" else "format_retry"
+                )
                 tracer.info(f"Extended max_iterations to {max_iterations} for {retry_reason}")
                 self._add_format_error_message(messages)
 
@@ -494,38 +494,24 @@ class ExtractLoop:
             configured if configured is not None else _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS
         )
 
-    def _response_hit_output_budget(self, response: Any) -> bool:
-        """Return whether a model response consumed the whole output-token budget.
+    def _budget_exhausted_error(self, response: Any, content: str) -> str:
+        """Build the dedicated, actionable error for a truncated response.
 
-        Detects truncation from either the backend finish reason or completion
-        tokens reaching the resolved cap, so a reasoning-heavy response that was
-        cut off mid-program is not mistaken for an ordinary format mistake.
-        String responses (tools disabled) carry no usage and are never classified
-        as budget-exhausted.
+        Truncation is detected only from the backend's explicit
+        ``finish_reason == "length"``; token counters are never used to infer it.
         """
-        if response is None or isinstance(response, str):
-            return False
         usage = getattr(response, "usage", None)
-        completion_tokens = 0
-        if isinstance(usage, dict):
-            completion_tokens = int(usage.get("completion_tokens") or 0)
-        hit_cap = completion_tokens >= self._effective_max_output_tokens
-        finish_reason = getattr(response, "finish_reason", None)
-        return bool(hit_cap or finish_reason == "length")
-
-    def _raise_output_budget_for_retry(self) -> bool:
-        """Raise the output cap once, bounded, for the single budget retry.
-
-        The new cap never exceeds twice the current effective cap nor
-        _EXTRACTION_MAX_OUTPUT_TOKENS_CEILING, and is never lowered.
-        """
-        ceiling = max(self._effective_max_output_tokens, _EXTRACTION_MAX_OUTPUT_TOKENS_CEILING)
-        raised_cap = min(self._effective_max_output_tokens * 2, ceiling)
-        if raised_cap <= self._effective_max_output_tokens:
-            return False
-        tracer.info(f"Raised extraction output cap to {raised_cap} tokens for the budget retry")
-        self._effective_max_output_tokens = raised_cap
-        return True
+        completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        details = (
+            f"finish_reason='length', output cap={self._effective_max_output_tokens} tokens"
+        )
+        if completion_tokens:
+            details += f", completion_tokens={completion_tokens}"
+        return (
+            "Response was cut off by the output-token budget "
+            f"({details}), response_preview={_preview_text(content)!r}. "
+            "Raise vlm.max_tokens in ov.conf or reduce the memory context before retrying."
+        )
 
     def _retryable_resolution_issues(self, operations: ResolvedOperations) -> List[Dict[str, Any]]:
         issues: List[Dict[str, Any]] = []
@@ -1221,8 +1207,11 @@ class ExtractLoop:
         Returns:
             Tuple of (tool_calls, operations) - one will be None, the other set
         """
-        # Call LLM with tools - use tools from strategy
-        tools = None
+        # Call LLM with tools - use tools from strategy. Pass tools=[] (not None)
+        # when tools are disabled so backends following the OpenAI backend's
+        # `tools is not None` convention still return a VLMResponse carrying
+        # finish_reason and usage instead of a bare string.
+        tools: Optional[List[Dict[str, Any]]] = []
         tool_choice = None
         if not self._disable_tools_for_iteration and self._tool_schemas:
             tools = self._tool_schemas
@@ -1284,6 +1273,22 @@ class ExtractLoop:
             # Case 2: VLMResponse without tool calls - get content from response
             content = response.content or ""
 
+        # Explicit truncation check, before any parsing: a response the backend
+        # already flagged as cut off is never trusted, even when the truncated
+        # body still parses as valid Python (trailing writes/deletes would be
+        # silently lost). Not routed through the format retry; run() treats
+        # budget_exhausted as terminal.
+        if getattr(response, "finish_reason", None) == "length":
+            self._last_llm_failure_kind = "budget_exhausted"
+            self._last_llm_failure_content = content
+            self._last_parse_error = self._budget_exhausted_error(response, content)
+            tracer.set("memory.extraction.parse_error", self._last_parse_error)
+            logger.debug(
+                "Response truncated by output-token budget "
+                f"failure_kind=budget_exhausted error={self._last_parse_error}"
+            )
+            return (None, None)
+
         # Parse operations from content
         if content:
             try:
@@ -1293,12 +1298,9 @@ class ExtractLoop:
                 operations, error = self._output_protocol.parse(content, self._output_context)
 
                 if error is not None:
-                    if _looks_like_canned_refusal(content):
-                        failure_kind = "refusal_text"
-                    elif self._response_hit_output_budget(response):
-                        failure_kind = "budget_exhausted"
-                    else:
-                        failure_kind = "parse_error"
+                    failure_kind = (
+                        "refusal_text" if _looks_like_canned_refusal(content) else "parse_error"
+                    )
                     self._last_llm_failure_kind = failure_kind
                     self._last_llm_failure_content = content
                     self._last_parse_error = error
@@ -1318,12 +1320,7 @@ class ExtractLoop:
                 logger.debug(f"Error parsing operations: {e}")
 
         # Case 3: No tool calls and no parsable operations
-        if self._response_hit_output_budget(response):
-            # Reasoning or output consumed the whole completion budget; an empty or
-            # partial payload is the expected symptom, not an ordinary format error.
-            self._last_llm_failure_kind = "budget_exhausted"
-        else:
-            self._last_llm_failure_kind = "empty_response" if not content else "parse_error"
+        self._last_llm_failure_kind = "empty_response" if not content else "parse_error"
         self._last_llm_failure_content = content or ""
         if not content:
             empty_error = self._output_protocol.describe_empty_response()
@@ -1359,20 +1356,10 @@ class ExtractLoop:
 
     def _add_format_error_message(self, messages: List[Dict[str, Any]]) -> None:
         """Add format error guidance message to prompt."""
-        budget_exhausted = self._last_llm_failure_kind == "budget_exhausted"
-        if budget_exhausted and self._last_llm_failure_content:
-            # Budget exhaustion is not an ordinary format mistake: show the model
-            # its own truncated program so the retry repairs it instead of
-            # starting over from scratch.
-            messages.append({"role": "assistant", "content": self._last_llm_failure_content})
-        if budget_exhausted:
-            guidance = self._output_protocol.render_budget_retry(self._last_parse_error)
-        else:
-            guidance = self._output_protocol.render_format_retry(self._last_parse_error)
         messages.append(
             {
                 "role": "user",
-                "content": guidance,
+                "content": self._output_protocol.render_format_retry(self._last_parse_error),
             }
         )
 
