@@ -1256,6 +1256,21 @@ class ExtractLoop:
                     f"[KVCache] prompt_tokens={prompt_tokens}, cached_tokens={cached_tokens}"
                 )
 
+        # Reject explicit truncation before handling tool calls or parsing:
+        # neither a partial tool call nor a parseable program is safe to use.
+        # run() treats budget_exhausted as terminal, without a format retry.
+        if getattr(response, "finish_reason", None) == "length":
+            content = getattr(response, "content", None) or ""
+            self._last_llm_failure_kind = "budget_exhausted"
+            self._last_llm_failure_content = content
+            self._last_parse_error = self._budget_exhausted_error(response, content)
+            tracer.set("memory.extraction.parse_error", self._last_parse_error)
+            logger.debug(
+                "Response truncated by output-token budget "
+                f"failure_kind=budget_exhausted error={self._last_parse_error}"
+            )
+            return (None, None)
+
         # Case 0: Handle string response (when tools are not provided) or None
         if response is None:
             content = ""
@@ -1272,22 +1287,6 @@ class ExtractLoop:
         else:
             # Case 2: VLMResponse without tool calls - get content from response
             content = response.content or ""
-
-        # Explicit truncation check, before any parsing: a response the backend
-        # already flagged as cut off is never trusted, even when the truncated
-        # body still parses as valid Python (trailing writes/deletes would be
-        # silently lost). Not routed through the format retry; run() treats
-        # budget_exhausted as terminal.
-        if getattr(response, "finish_reason", None) == "length":
-            self._last_llm_failure_kind = "budget_exhausted"
-            self._last_llm_failure_content = content
-            self._last_parse_error = self._budget_exhausted_error(response, content)
-            tracer.set("memory.extraction.parse_error", self._last_parse_error)
-            logger.debug(
-                "Response truncated by output-token budget "
-                f"failure_kind=budget_exhausted error={self._last_parse_error}"
-            )
-            return (None, None)
 
         # Parse operations from content
         if content:
