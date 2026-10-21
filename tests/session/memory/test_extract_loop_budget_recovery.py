@@ -12,11 +12,11 @@ output, and no completion_tokens-based truncation inference.
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-from openviking.models.vlm.base import VLMResponse
+from openviking.models.vlm.base import ToolCall, VLMResponse
 from openviking.session.memory.dataclass import MemoryTypeSchema
 from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.page_id_map import PageIdMap
@@ -313,3 +313,58 @@ class TestNoTokenCounterInference:
         assert len(vlm.calls) == 2
         assert vlm.calls[1]["max_tokens"] == _DEFAULT_CAP
         assert _assistant_contents(vlm.calls[1]["messages"]) == []
+
+
+class TestExtractionContentBoundary:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_tools", [False, True])
+    @pytest.mark.parametrize("structured", [False, True])
+    async def test_extraction_cleans_local_text_without_mutating_response(
+        self, with_tools, structured
+    ):
+        raw_content = "<think>internal reasoning</think>\n  sdk.commit()  "
+        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        response = (
+            VLMResponse(content=raw_content, finish_reason="stop", usage=usage.copy())
+            if structured
+            else raw_content
+        )
+        vlm = ScriptedVLM([response])
+        loop = _make_loop(vlm)
+        loop.context_provider.get_tools = lambda: ["read"] if with_tools else []
+
+        operations, _ = await _run_loop(loop)
+
+        assert operations is not None
+        assert len(vlm.calls) == 1
+        assert bool(vlm.calls[0]["tools"]) is with_tools
+        if structured:
+            assert response.content == raw_content
+            assert response.finish_reason == "stop"
+            assert response.usage == usage
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("finish_reason", ["tool_calls", "length"])
+    async def test_tool_call_respects_finish_reason(self, finish_reason):
+        response = VLMResponse(
+            content="<think>planning</think>I will read the file.",
+            tool_calls=[ToolCall(id="read-1", name="read", arguments={"uri": "viking://user/test"})],
+            finish_reason=finish_reason,
+        )
+        vlm = ScriptedVLM([response, VLMResponse(content="<think>done</think>sdk.commit()")])
+        loop = _make_loop(vlm)
+        loop.context_provider.get_tools = lambda: ["read"]
+        execute = AsyncMock(return_value={"content": "test"})
+        loop.context_provider.execute_tool = execute
+
+        if finish_reason == "length":
+            with pytest.raises(RuntimeError, match="output-token budget"):
+                await _run_loop(loop)
+            execute.assert_not_awaited()
+            assert len(vlm.calls) == 1
+        else:
+            operations, _ = await _run_loop(loop)
+            assert operations is not None
+            execute.assert_awaited_once()
+            assert len(vlm.calls) == 2
+        assert response.content == "<think>planning</think>I will read the file."

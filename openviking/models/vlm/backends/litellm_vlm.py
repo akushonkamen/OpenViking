@@ -473,11 +473,8 @@ class LiteLLMVLMProvider(VLMBase):
             tracer.info(f"response={response}")
             if tools is not None:
                 result = self._build_vlm_response(response, has_tools=True)
-                if tools:
-                    return result
-                # tools=[] (tools disabled): keep the VLMResponse so finish_reason
-                # and usage survive, but still strip inline thinking from content.
-                result.content = self._clean_response(result.content or "")
+                if not tools:
+                    result.content = self._clean_response(result.content or "")
                 return result
             return self._clean_response(self._extract_content_from_response(response))
 
@@ -510,11 +507,8 @@ class LiteLLMVLMProvider(VLMBase):
             tracer.info(f"response={response}")
             if tools is not None:
                 result = self._build_vlm_response(response, has_tools=True)
-                if tools:
-                    return result
-                # tools=[] (tools disabled): keep the VLMResponse so finish_reason
-                # and usage survive, but still strip inline thinking from content.
-                result.content = self._clean_response(result.content or "")
+                if not tools:
+                    result.content = self._clean_response(result.content or "")
                 return result
             return self._clean_response(self._extract_content_from_response(response))
 
@@ -539,11 +533,8 @@ class LiteLLMVLMProvider(VLMBase):
             self._update_token_usage_from_response(response, duration_seconds=elapsed)
             if tools is not None:
                 result = self._build_vlm_response(response, has_tools=True)
-                if tools:
-                    return result
-                # tools=[] (tools disabled): keep the VLMResponse so finish_reason
-                # and usage survive, but still strip inline thinking from content.
-                result.content = self._clean_response(result.content or "")
+                if not tools:
+                    result.content = self._clean_response(result.content or "")
                 return result
             return self._clean_response(self._extract_content_from_response(response))
 
@@ -568,11 +559,8 @@ class LiteLLMVLMProvider(VLMBase):
             self._update_token_usage_from_response(response, duration_seconds=elapsed)
             if tools is not None:
                 result = self._build_vlm_response(response, has_tools=True)
-                if tools:
-                    return result
-                # tools=[] (tools disabled): keep the VLMResponse so finish_reason
-                # and usage survive, but still strip inline thinking from content.
-                result.content = self._clean_response(result.content or "")
+                if not tools:
+                    result.content = self._clean_response(result.content or "")
                 return result
             return self._clean_response(self._extract_content_from_response(response))
 

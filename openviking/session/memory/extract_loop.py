@@ -1288,6 +1288,9 @@ class ExtractLoop:
             # Case 2: VLMResponse without tool calls - get content from response
             content = response.content or ""
 
+        # No tool calls (Case 0 & 2): strip reasoning tags in the text before parsing.
+        content = VLMBase._clean_response(content)
+
         # Parse operations from content
         if content:
             try:
