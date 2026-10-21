@@ -421,7 +421,6 @@ JSON 输出 - 错误：
 | GET | `/api/v1/sessions/{session_id}/archives/{archive_id}` | 获取会话归档 |
 | DELETE | `/api/v1/sessions/{session_id}` | 删除会话 |
 | POST | `/api/v1/sessions/{session_id}/commit` | 归档会话并提取记忆 |
-| POST | `/api/v1/sessions/{session_id}/extract` | 提取记忆 |
 | POST | `/api/v1/sessions/{session_id}/messages` | 添加单条消息 |
 | POST | `/api/v1/sessions/{session_id}/messages/batch` | 批量添加消息 |
 | POST | `/api/v1/search/recall` | 已弃用：search 接口 `mode="context"` 之上的轻量预设 |
@@ -487,6 +486,7 @@ JSON 输出 - 错误：
 |------|------|------|
 | GET | `/api/v1/admin/configuration` | 获取 Cluster 层显式运行时配置 |
 | PATCH | `/api/v1/admin/configuration` | 更新 Cluster 层运行时配置 |
+| POST | `/api/v1/admin/configuration/test-model` | 测试草稿模型或 Embedding 连接，不保存配置 |
 | POST | `/api/v1/admin/restart` | 请求支持该能力的服务进程优雅重启（仅 ROOT） |
 | GET | `/api/v1/admin/accounts/{account_id}/configuration` | 获取 Account 层显式运行时配置 |
 | PATCH | `/api/v1/admin/accounts/{account_id}/configuration` | 更新 Account 层运行时配置 |
@@ -501,9 +501,11 @@ JSON 输出 - 错误：
 | POST | `/api/v1/admin/accounts` | 创建账号及首个管理员 |
 | GET | `/api/v1/admin/accounts` | 列出账号 |
 | POST | `/api/v1/admin/migrate` | 迁移旧版身份数据 |
+| GET | `/api/v1/admin/accounts/{account_id}` | 获取单个账号的无凭据元数据 |
 | DELETE | `/api/v1/admin/accounts/{account_id}` | 删除账号 |
 | POST | `/api/v1/admin/accounts/{account_id}/users` | 注册用户 |
 | GET | `/api/v1/admin/accounts/{account_id}/users` | 列出用户 |
+| GET | `/api/v1/admin/accounts/{account_id}/users/{user_id}` | 获取单个用户的无凭据成员信息（user_id、role） |
 | GET | `/api/v1/admin/accounts/{account_id}/users/{user_id}/settings` | 获取用户记忆策略 |
 | PATCH | `/api/v1/admin/accounts/{account_id}/users/{user_id}/settings` | 更新用户记忆策略 |
 | DELETE | `/api/v1/admin/accounts/{account_id}/users/{user_id}` | 移除用户 |
@@ -516,12 +518,21 @@ JSON 输出 - 错误：
 | PUT | `/api/v1/admin/accounts/{account_id}/groups/{group_id}/members/{user_id}` | 添加用户组成员 |
 | DELETE | `/api/v1/admin/accounts/{account_id}/groups/{group_id}/members/{user_id}` | 移除用户组成员 |
 | GET | `/api/v1/privacy-configs` | 列出隐私配置分类 |
+| GET | `/api/v1/privacy-configs/tree` | 树形列出当前目标和字段元数据，不返回值 |
+| POST | `/api/v1/privacy-configs/scan` | 扫描或修复正文中的登记值 |
 | GET | `/api/v1/privacy-configs/{category}` | 列出分类目标 |
 | GET | `/api/v1/privacy-configs/{category}/{target_key}` | 获取生效配置 |
+| GET | `/api/v1/privacy-configs/{category}/{target_key}/fields` | 列出不含明文值的安全字段元数据 |
+| GET | `/api/v1/privacy-configs/{category}/{target_key}/field` | 获取单字段引用或显式读取值 |
+| POST | `/api/v1/privacy-configs/resolve` | 按字段 reference/URI 显式读取值 |
 | GET | `/api/v1/privacy-configs/{category}/{target_key}/versions` | 列出配置版本 |
 | GET | `/api/v1/privacy-configs/{category}/{target_key}/versions/{version}` | 获取指定版本 |
 | POST | `/api/v1/privacy-configs/{category}/{target_key}` | 写入并激活新版本 |
+| PATCH | `/api/v1/privacy-configs/{category}/{target_key}` | 原子合并字段；不存在时创建 |
 | POST | `/api/v1/privacy-configs/{category}/{target_key}/activate` | 激活指定版本 |
+| DELETE | `/api/v1/privacy-configs/{category}/{target_key}` | 删除目标及全部版本 |
+| DELETE | `/api/v1/privacy-configs/{category}/{target_key}/field` | 删除当前字段 |
+| DELETE | `/api/v1/privacy-configs/selector` | 按 URI/reference 删除目标或字段 |
 
 ### [OpenViking 网关管理](25-gateway.md)
 
@@ -539,7 +550,7 @@ JSON 输出 - 错误：
 | GET | `/gateway/admin/logs` | 读取调用方可见的请求日志 |
 | GET | `/gateway/admin/upstreams` | 列出本账号的上游 |
 | PUT / DELETE | `/gateway/admin/upstreams/{identifier}` | 创建/替换或删除上游 |
-| POST | `/gateway/admin/upstreams/{identifier}/test` | 测试上游连接 |
+| POST | `/gateway/admin/upstreams/{identifier}/test` | 测试上游连接或模型 |
 | POST | `/gateway/admin/upstreams/import-vlm` | 把 Server 的 VLM 配置导入为上游（仅嵌入部署） |
 | GET | `/gateway/admin/policies` | 列出本账号的上下文配置 |
 | PUT / DELETE | `/gateway/admin/policies/{identifier}` | 创建/替换或删除上下文配置 |
@@ -570,6 +581,8 @@ JSON 输出 - 错误：
 | POST | `/bot/v1/chat` | VikingBot 非流式对话 |
 | POST | `/bot/v1/chat/stream` | VikingBot 流式对话 |
 | POST | `/bot/v1/feedback` | 提交 VikingBot 回答反馈 |
+| POST | `/bot/v1/sessions/{session_id}/interrupt` | 中断活跃或排队中的 VikingBot 会话 |
+| POST | `/bot/v1/sessions/{session_id}/steer` | 向活跃流式会话发送追加输入 |
 | POST | `/bot/v1/compile` | 已停用；返回新接口迁移提示 |
 | GET | `/bot/v1/compile/{task_id}` | 已停用；返回 Task 接口迁移提示 |
 | POST | `/bot/v1/compile/{task_id}/cancel` | 已停用；返回 Task 取消接口迁移提示 |

@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Content endpoints for OpenViking HTTP Server."""
 
-from typing import Literal
+from typing import Literal, Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -19,6 +19,7 @@ from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.pyagfs.exceptions import AGFSClientError, AGFSNotFoundError
 from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
 from openviking.server.auth import (
+    get_download_request_context,
     get_request_context,
     require_role,
 )
@@ -202,10 +203,20 @@ async def overview(
 
 @router.get("/download")
 async def download(
-    uri: str = Query(..., description="Viking URI"),
-    _ctx: RequestContext = Depends(get_request_context),
+    request: Request,
+    uri: Optional[str] = Query(None, description="Viking URI"),
+    _ctx: RequestContext = Depends(get_download_request_context),
 ):
-    """Download file as raw bytes (for images, binaries, etc.)."""
+    """Download file as raw bytes (for images, binaries, etc.).
+
+    A signed ``?token=`` from the MCP ``download`` tool serves only the URI bound to the
+    token; any ``uri`` query parameter is ignored on that path.
+    """
+    signed_uri = getattr(request.state, "signed_download_uri", None)
+    if signed_uri is not None:
+        uri = signed_uri
+    if not uri:
+        raise HTTPException(status_code=400, detail="uri is required")
     service = get_service()
     uri = validate_request_viking_uri(resolve_path_variables(uri), _ctx)
     try:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Mapping, Protocol, Sequence
 
@@ -361,7 +361,8 @@ class AclManager:
                 limit=500,
                 cursor=cursor,
                 output_fields=output_fields,
-                ctx=ctx,
+                # ACL resolution must see records the caller's own grants hide.
+                ctx=replace(ctx, bypass_acl=True),
             )
             records.extend(page)
             if cursor is None:

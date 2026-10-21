@@ -145,7 +145,8 @@ async def test_async_http_client_sends_message_semantics_and_turn_retention():
 
 
 @pytest.mark.asyncio
-async def test_async_http_client_normalizes_message_part_objects():
+@pytest.mark.parametrize("tool_input", [None, {}, {"query": "OpenViking"}])
+async def test_async_http_client_normalizes_message_part_objects(tool_input):
     client = AsyncHTTPClient(url="http://localhost:1933")
     fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
     client._http = fake_http
@@ -165,7 +166,7 @@ async def test_async_http_client_normalizes_message_part_objects():
             ToolPart(
                 tool_id="call-1",
                 tool_name="search",
-                tool_input={"query": "OpenViking"},
+                tool_input=tool_input,
                 tool_status="completed",
                 duration_ms=12.5,
                 prompt_tokens=42,
@@ -202,7 +203,7 @@ async def test_async_http_client_normalizes_message_part_objects():
                     "type": "tool",
                     "tool_id": "call-1",
                     "tool_name": "search",
-                    "tool_input": {"query": "OpenViking"},
+                    **({"tool_input": tool_input} if tool_input is not None else {}),
                     "tool_status": "completed",
                     "duration_ms": 12.5,
                     "prompt_tokens": 42,
@@ -653,6 +654,8 @@ def test_sync_http_client_declares_common_sync_methods_explicitly():
         "get_task",
         "list_tasks",
         "admin_list_accounts",
+        "admin_get_account",
+        "admin_get_user",
     ]:
         assert method_name in explicit_methods, method_name
 
@@ -1187,6 +1190,37 @@ async def test_admin_seed_payloads_are_sent():
         "seed": "alice-seed",
     }
     assert fake_http.post.await_args_list[2].kwargs["json"] == {"seed": "new-seed"}
+
+
+@pytest.mark.asyncio
+async def test_admin_get_account_uses_exact_path_and_returns_metadata():
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    client._request = AsyncMock(return_value=object())
+    client._handle_response = lambda _response: {
+        "account_id": "acct",
+        "status": "active",
+        "user_count": 2,
+    }
+
+    result = await client.admin_get_account("acct")
+
+    client._request.assert_awaited_once_with("GET", "/api/v1/admin/accounts/acct")
+    assert result["user_count"] == 2
+    assert "api_key" not in result
+
+
+@pytest.mark.asyncio
+async def test_admin_get_user_reads_membership_from_point_read_path():
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    client._request = AsyncMock(return_value=object())
+    client._handle_response = lambda _response: {"user_id": "alice", "role": "admin"}
+
+    result = await client.admin_get_user("acct", "alice")
+    client._request.assert_awaited_once_with(
+        "GET", "/api/v1/admin/accounts/acct/users/alice"
+    )
+    assert result == {"user_id": "alice", "role": "admin"}
+    assert "api_key" not in result and "key_prefix" not in result
 
 
 @pytest.mark.asyncio

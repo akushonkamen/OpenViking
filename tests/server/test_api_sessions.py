@@ -321,7 +321,7 @@ async def test_get_session_context_rejects_negative_token_budget(client: httpx.A
     assert body["error"]["details"] == {"field": "token_budget", "value": -1}
 
 
-async def test_tool_result_externalization_read_and_search(client: httpx.AsyncClient):
+async def test_tool_result_externalization_read_and_search(client: httpx.AsyncClient, service):
     session_id = "tool-result-api-session"
     raw = "alpha\n" + ("needle-" * 4000) + "\nomega"
 
@@ -352,6 +352,9 @@ async def test_tool_result_externalization_read_and_search(client: httpx.AsyncCl
     assert raw not in part["tool_output"]
     assert "kind: text" in part["tool_output"]
     assert "openviking_tool_result_search" in part["tool_output"]
+
+    ctx = RequestContext(user=DEFAULT_USER, role=Role.ROOT)
+    await service.viking_fs.write_file(f"{session_uri}/messages.jsonl", "invalid JSONL", ctx=ctx)
 
     tool_result_id = part["tool_output_ref"].rsplit("/", 1)[-1]
     read_resp = await client.get(
@@ -854,6 +857,8 @@ async def test_session_load_recovers_message_count_from_live_messages(service):
 
 async def test_write_responses_return_pending_tokens_for_commit_policy(
     client: httpx.AsyncClient,
+    service,
+    monkeypatch,
 ):
     """A commit policy must be able to decide from the write response alone.
 
@@ -863,6 +868,16 @@ async def test_write_responses_return_pending_tokens_for_commit_policy(
     create_resp = await client.post("/api/v1/sessions", json={})
     session_id = create_resp.json()["result"]["session_id"]
 
+    session_uri = create_resp.json()["result"]["uri"]
+    reads = []
+    original_read = service.viking_fs._async_agfs.read
+
+    async def read(path, *args, **kwargs):
+        reads.append(path.rsplit("/", 1)[-1])
+        return await original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(service.viking_fs._async_agfs, "read", read)
+
     add_resp = await client.post(
         f"/api/v1/sessions/{session_id}/messages",
         json=_message_request("user", content="Hello, world!"),
@@ -870,6 +885,13 @@ async def test_write_responses_return_pending_tokens_for_commit_policy(
     assert add_resp.status_code == 200
     after_add = add_resp.json()["result"]["pending_tokens"]
     assert after_add > 0
+    assert reads.count("messages.jsonl") == reads.count(".meta.json") == 1
+
+    ctx = RequestContext(user=DEFAULT_USER, role=Role.ROOT)
+    meta = json.loads(await service.viking_fs.read_file(f"{session_uri}/.meta.json", ctx=ctx))
+    meta["pending_tokens"] = 0
+    await service.viking_fs.write_file(f"{session_uri}/.meta.json", json.dumps(meta), ctx=ctx)
+    reads.clear()
 
     batch_resp = await client.post(
         f"/api/v1/sessions/{session_id}/messages/batch",
@@ -883,11 +905,23 @@ async def test_write_responses_return_pending_tokens_for_commit_policy(
     assert batch_resp.status_code == 200
     after_batch = batch_resp.json()["result"]["pending_tokens"]
     assert after_batch > after_add
+    assert reads.count("messages.jsonl") == reads.count(".meta.json") == 1
 
     # The write-returned value must match what get_session would have reported,
     # which is exactly the extra round trip this field removes.
     get_resp = await client.get(f"/api/v1/sessions/{session_id}")
     assert get_resp.json()["result"]["pending_tokens"] == after_batch
+
+    empty_resp = await client.post(
+        f"/api/v1/sessions/{session_id}/messages/batch", json={"messages": []}
+    )
+    assert empty_resp.status_code == 200
+    assert empty_resp.json()["result"] == {
+        "session_id": session_id,
+        "message_count": 3,
+        "pending_tokens": after_batch,
+        "added": 0,
+    }
 
 
 async def test_add_message_accepts_image_part(client: httpx.AsyncClient, service):
@@ -1305,33 +1339,6 @@ async def test_commit_updates_archive_metadata_before_background_task(client: ht
     assert after_result["message_count"] == 1
     assert after_result["total_message_count"] == 4
     assert after_result["commit_count"] == 1
-
-
-async def test_extract_session_jsonable_regression(client: httpx.AsyncClient, service, monkeypatch):
-    """Regression: extract endpoint should serialize internal objects."""
-
-    class FakeMemory:
-        __slots__ = ("uri",)
-
-        def __init__(self, uri: str):
-            self.uri = uri
-
-        def to_dict(self):
-            return {"uri": self.uri}
-
-    async def fake_extract(_session_id: str, _ctx):
-        return [FakeMemory("viking://user/default/memories/mock.md")]
-
-    monkeypatch.setattr(service.sessions, "extract", fake_extract)
-
-    create_resp = await client.post("/api/v1/sessions", json={"user": "test"})
-    session_id = create_resp.json()["result"]["session_id"]
-
-    resp = await client.post(f"/api/v1/sessions/{session_id}/extract")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "ok"
-    assert body["result"] == [{"uri": "viking://user/default/memories/mock.md"}]
 
 
 async def test_get_session_context_endpoint_returns_trimmed_latest_archive_and_messages(

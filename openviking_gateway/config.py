@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Configuration for embedded and standalone gateway hosts."""
 
+import json
 import logging
 import os
+import re
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -34,12 +36,48 @@ def normalize_url(value: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc.lower(), parsed.path.rstrip("/"), "", ""))
 
 
+class RuleChanges(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    add: list[str] = Field(default_factory=list)
+    # Entries of the packaged list, written exactly as there.
+    remove: list[str] = Field(default_factory=list)
+
+
+class ClientRules(BaseModel):
+    """Changes to the packaged ``client-rules.json``, applied when the gateway starts."""
+
+    model_config = ConfigDict(extra="forbid")
+    plugin_tags: RuleChanges = Field(default_factory=RuleChanges)
+    noise_tags: RuleChanges = Field(default_factory=RuleChanges)
+    noise_patterns: RuleChanges = Field(default_factory=RuleChanges)
+    auxiliary_patterns: RuleChanges = Field(default_factory=RuleChanges)
+
+    @field_validator("plugin_tags", "noise_tags")
+    @classmethod
+    def validate_tags(cls, value: RuleChanges) -> RuleChanges:
+        # Element names, as clients write them in <name ...>.
+        if bad := [tag for tag in value.add if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]*", tag)]:
+            raise ValueError(f"tag names must be ASCII letters, digits, _ . : or -: {bad}")
+        return value
+
+    @field_validator("noise_patterns", "auxiliary_patterns")
+    @classmethod
+    def validate_patterns(cls, value: RuleChanges) -> RuleChanges:
+        for pattern in value.add:
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(f"invalid regex {pattern!r}: {error}") from None
+        return value
+
+
 class GatewayConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # Settings an upgraded configuration may still carry; rejecting them would stop the host.
     removed_fields: ClassVar[frozenset[str]] = frozenset({"encryption_key_env"})
 
     public_url: str = ""
+    mcp_file_links: Literal["proxy", "direct"] = "proxy"
     storage_path: str = "~/.openviking/gateway"
     management_key: str = Field(default="", repr=False)
     min_server_version: str = "0.4.16"
@@ -49,6 +87,7 @@ class GatewayConfig(BaseModel):
     max_body_bytes: int = Field(default=32 * 1024 * 1024, ge=1024)
     upstream_timeout_seconds: float = Field(default=600, gt=0)
     health_interval_seconds: float = Field(default=60, ge=1)
+    client_rules: ClientRules = Field(default_factory=ClientRules)
 
     @model_validator(mode="before")
     @classmethod
@@ -69,6 +108,12 @@ class GatewayConfig(BaseModel):
             if override and not override.startswith(("tcp://", "udp://")):
                 value[field] = override
         return value
+
+    @field_validator("client_rules", mode="before")
+    @classmethod
+    def parse_client_rules(cls, value):
+        # OPENVIKING_GATEWAY_CLIENT_RULES carries the section as JSON.
+        return json.loads(value) if isinstance(value, str) else value
 
     @field_validator("public_url")
     @classmethod

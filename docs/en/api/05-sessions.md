@@ -1333,6 +1333,8 @@ ov add-memory '[{"role":"user","content":"Hello"},{"role":"assistant","content":
 
 Commit a session. Message archiving (Phase 1) completes before the response returns. Summary generation and memory extraction (Phase 2) run asynchronously in the background when messages are archived. Archived commits return `status: "accepted"` with a `task_id`; no-op commits return `status: "skipped"` with `task_id: null`.
 
+The former standalone session `extract` endpoint has been removed. Use `commit` for memory extraction. This archives messages according to the retention policy; use the returned `task_id` to check the background extraction result. An `accepted` response does not mean extraction is complete.
+
 **Two-Phase Commit Flow:**
 - **Phase 1 (Synchronous)**: Split messages according to the retention policy, persist the archive and recovery records, enqueue Phase 2, and write retained messages back to the live session
 - **Phase 2 (Asynchronous)**: Extract long-term memories; generate WM/checkpoint summaries only when the effective WM policy is enabled (default: disabled)
@@ -1472,43 +1474,6 @@ ov session commit a1b2c3d4
   }
 }
 ```
-
----
-
-### extract()
-
-#### 1. API Implementation Introduction
-
-Extract memories from the existing session’s current live messages and wait for the extraction result. This does not create a commit task or replace archiving; previously archived history is not included again as live input.
-
-**Code Entries:**
-- `openviking/server/routers/sessions.py:extract_session()` - HTTP route
-
-#### 2. Interface and Parameter Description
-
-**Parameters**
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| session_id | str | Yes | - | Session ID to extract memories from |
-
-#### 3. Usage Examples
-
-**HTTP API**
-
-```http
-POST /api/v1/sessions/{session_id}/extract
-```
-
-```bash
-curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/extract \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key"
-```
-
-**Response Example**
-
-The response’s `result` field contains the list of extracted memory writes. The exact item shape depends on which memories were produced for that session.
 
 <a id="get_task"></a><a id="list_tasks"></a>
 

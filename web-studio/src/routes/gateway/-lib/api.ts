@@ -17,6 +17,8 @@ export type Vendor =
   | 'ark'
   | 'byteplus'
 export type AuthMode = 'managed' | 'passthrough'
+/** Header the upstream key is sent in. */
+export type KeyHeader = 'authorization' | 'api-key' | 'x-api-key'
 
 /** Sources recall searches, in display order. */
 export const CONTEXT_TYPES = ['memory', 'resource', 'skill'] as const
@@ -61,6 +63,7 @@ type UpstreamSettings = {
   /** Append the selected protocol's endpoint path to base_url. */
   append_endpoint_path: boolean
   auth_mode: AuthMode
+  key_header: KeyHeader
   models: string[]
   /** Name clients use → model sent to the upstream. */
   aliases: Record<string, string>
@@ -204,6 +207,32 @@ export type OpenVikingHealth = {
   reason?: string
 }
 
+/** A conversation whose latest long model calls all missed the prompt cache. */
+export type CacheMiss = {
+  upstream_id: string
+  model: string
+  /** Long calls in a row without a cache hit. */
+  streak: number
+  /** Epoch seconds of the newest call. */
+  last_at: number
+}
+
+export type CacheAlerts = {
+  /** Conversations missing the cache; null without any. */
+  misses: {
+    conversations: number
+    /** Shortest streak and smallest first-call input among them. */
+    streak: number
+    input_tokens: number
+    /** All are Anthropic conversations that never wrote the cache either. */
+    no_writes: boolean
+    /** The newest three conversations. */
+    recent: CacheMiss[]
+  } | null
+  /** Ids of upstreams whose long calls have not hit the cache lately, sorted. */
+  unreported: string[]
+}
+
 export type Overview = {
   /** Model requests in the sample (memory-sync events excluded). */
   requests: number
@@ -223,6 +252,8 @@ export type Overview = {
   sample_limit: number
   /** Days the request log keeps records. */
   log_retention_days: number
+  /** Conversations and upstreams missing the prompt cache; null without any. */
+  cache_alerts: CacheAlerts | null
 }
 
 /** One request-log record (metadata only); every field but `time` is optional. */
@@ -261,7 +292,10 @@ export type LogRecord = {
   degradation?: string
   /** Anchor of the cut whose replacement this request used. */
   compaction_applied?: string
-  /** Why generating a summary failed; the full history was sent. */
+  /**
+   * Why compaction failed. The full history was sent, except for
+   * `still_over_threshold`, where the summary was written and kept.
+   */
   compaction_failed?: string
   /** Estimated size of the summary written for this request. */
   compaction_tokens?: number
@@ -308,8 +342,17 @@ export type VlmImportResult = {
 export type UpstreamTestResult = {
   url?: string
   ok: boolean
+  kind?: 'connection' | 'model'
   status?: number
   reason?: string
+  response?: {
+    http_version: string
+    status: number
+    reason: string
+    headers: Record<string, string | string[]>
+    body: string
+    truncated?: boolean
+  }
 }
 
 /** Conversation to resync, taken from a log record. */
@@ -544,9 +587,15 @@ export const saveUpstream = (
 export const deleteUpstream = (connection: GatewayConnection, id: string) =>
   send<{ deleted: boolean }>(connection, 'DELETE', ['upstreams', id])
 
-/** Calls the upstream's model list with its stored credentials. */
-export const testUpstream = (connection: GatewayConnection, id: string) =>
-  send<UpstreamTestResult>(connection, 'POST', ['upstreams', id, 'test'])
+/** Checks connectivity, or sends one small generation request when a model is given. */
+export const testUpstream = (
+  connection: GatewayConnection,
+  id: string,
+  model?: string,
+) =>
+  send<UpstreamTestResult>(connection, 'POST', ['upstreams', id, 'test'], {
+    body: model ? { model } : {},
+  })
 
 export const listProfiles = (connection: GatewayConnection) =>
   send<Profile[]>(connection, 'GET', ['policies'])

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_work_index import bind_task_context
 from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.utils import MemoryFileUtils
 from openviking.session.memory.utils.content_visibility import visible_content
@@ -20,6 +21,21 @@ from openviking_cli.exceptions import (
     PermissionDeniedError,
 )
 from openviking_cli.session.user_id import UserIdentifier
+
+
+@pytest.fixture(autouse=True)
+def run_direct_coordinator_operations_inline(request, monkeypatch):
+    if "service" in request.fixturenames:
+        return
+
+    async def run_tracked_operation(_task_type, *, operation, **_kwargs):
+        with bind_task_context("test-task", "default", "test-user", enqueued_work=[]):
+            return await operation(), "test-task"
+
+    monkeypatch.setattr(
+        "openviking.storage.content_write.run_tracked_operation",
+        run_tracked_operation,
+    )
 
 
 @pytest.mark.asyncio
@@ -982,7 +998,11 @@ async def test_create_mode_valid_extensions_pass(monkeypatch):
             del uri, mode, ctx, lock_handle, lease_ref, is_new_file
             return content
 
+        async def _fake_wait_for_queues(**_kwargs):
+            return None
+
         monkeypatch.setattr(coordinator, "_write_in_place", _fake_write_in_place)
+        monkeypatch.setattr(coordinator, "_wait_for_request", _fake_wait_for_queues)
 
         result = await coordinator.write(
             uri=file_uri, content="content", mode="create", ctx=ctx, wait=True

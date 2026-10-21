@@ -332,6 +332,8 @@ async def rm(
         response_result["semantic_status"] = result["semantic_status"]
     if isinstance(result, dict) and "queue_status" in result:
         response_result["queue_status"] = result["queue_status"]
+    if isinstance(result, dict) and "task_id" in result:
+        response_result["task_id"] = result["task_id"]
     return Response(status="ok", result=response_result)
 
 

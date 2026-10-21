@@ -74,7 +74,7 @@ All configuration is via environment variables:
 | `OV_ACCOUNT` | `default` | Tenant — sent as `X-OpenViking-Account` |
 | `OV_USER` | `default` | User — sent as `X-OpenViking-User` |
 | `OV_AGENT` | `default` | Actor peer ID — sent as `X-OpenViking-Actor-Peer` |
-| `OV_BIND` | `0.0.0.0:8765` | Host:port the tool server binds to |
+| `OV_BIND` | `0.0.0.0:8765` | Host:port the tool server binds to; bracket IPv6 addresses, e.g. `[::1]:8765` |
 | `OV_TIMEOUT` | `30` | HTTP timeout in seconds when calling OpenViking |
 
 There is no config file. This is intentional — make the deployment unit one

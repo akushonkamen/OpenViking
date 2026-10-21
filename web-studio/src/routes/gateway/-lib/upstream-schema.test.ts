@@ -167,20 +167,36 @@ describe('base URLs', () => {
     ['http://10.0.0.5:8000', true],
     ['ftp://example.com', false],
     ['https://user:pass@example.com', false],
-    ['https://example.com/?a=1', false],
-    ['https://example.com/?', false],
+    ['https://example.com/?a=1', true],
+    ['https://example.com/{api_key}/v1?key={api_key}', true],
+    ['https://example.com/v1?key={token}', false],
+    ['https://{api_key}.example.com/v1', false],
     ['https://example.com/#top', false],
     ['example.com', false],
   ])('%s → %s', (url, valid) => {
     expect(isValidBaseUrl(url)).toBe(valid)
   })
 
-  it.each(urlVectors)(
+  // The browser never sends a client query and never routes other paths.
+  it.each(
+    urlVectors.filter((vector) => !('query' in vector || 'error' in vector)),
+  )(
     'joins the shared URL vector: $name',
-    ({ base_url, protocol, path, expected }) => {
-      expect(upstreamUrl(base_url, protocol as Protocol, path)).toBe(expected)
+    ({ base_url, protocol, path, expected, ...vector }) => {
+      const append =
+        'append_endpoint_path' in vector ? vector.append_endpoint_path : true
+      expect(upstreamUrl(base_url, protocol as Protocol, path, append)).toBe(
+        expected,
+      )
     },
   )
+
+  it('names the placeholder rule when the URL breaks it', () => {
+    expect(
+      validateUpstream(input({ base_url: 'https://example.com/v1?k={key}' }))
+        .base_url?.key,
+    ).toBe('validation.baseUrlPlaceholder')
+  })
 
   it.each([
     ['anthropic', '/v1/messages'],

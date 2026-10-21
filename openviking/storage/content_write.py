@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -19,6 +20,7 @@ from openviking.core.namespace import (
     relative_uri_path,
     uri_parts,
 )
+from openviking.privacy.sanitizer import PrivacySanitizer
 from openviking.resource.processing_mode import (
     DEFAULT_PROCESSING_MODE,
     ProcessingMode,
@@ -26,6 +28,9 @@ from openviking.resource.processing_mode import (
 )
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
+from openviking.service.task_tracker import get_task_tracker, run_tracked_operation
+from openviking.service.task_tracker_concurrency import run_to_completion
+from openviking.service.task_work_index import get_enqueued_work_ids, get_task_context
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.utils.resource_refs import (
@@ -75,7 +80,6 @@ from openviking.storage.resource_target import AgfsResourceTarget
 from openviking.storage.vector_ids import vector_record_id
 from openviking.storage.viking_fs import VikingFS
 from openviking.telemetry import get_current_telemetry
-from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.content_hash import content_md5
 from openviking.utils.embedding_utils import vectorize_directory_meta
 from openviking.utils.ingest_options import IngestOptions
@@ -84,6 +88,7 @@ from openviking.utils.summarizer import FileRefreshRequest, Summarizer
 from openviking.utils.tags import normalize_search_tags
 from openviking_cli.exceptions import (
     ConflictError,
+    DeadlineExceededError,
     InvalidArgumentError,
     NotFoundError,
     OpenVikingError,
@@ -166,6 +171,13 @@ def _queue_has_errors(queue_status: Optional[Dict[str, Any]], name: str) -> bool
         return bool(status.get("errors"))
 
 
+def _result_has_queue_errors(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    queue_status = result.get("queue_status")
+    return any(_queue_has_errors(queue_status, name) for name in ("Semantic", "Embedding"))
+
+
 @dataclass(frozen=True)
 class _BatchRefreshOutcome:
     queue_status: Optional[Dict[str, Any]]
@@ -192,9 +204,52 @@ class _BatchRefreshOutcome:
 class ContentWriteCoordinator:
     """Write a file (create or modify) and trigger downstream maintenance."""
 
-    def __init__(self, viking_fs: VikingFS, vikingdb: Any = None):
+    def __init__(
+        self,
+        viking_fs: VikingFS,
+        vikingdb: Any = None,
+        privacy_sanitizer: PrivacySanitizer | None = None,
+    ):
         self._viking_fs = viking_fs
         self._vikingdb = vikingdb
+        self._privacy_sanitizer = privacy_sanitizer
+
+    async def _sanitize_text(
+        self,
+        content: str,
+        *,
+        uri: str,
+        ctx: RequestContext,
+    ) -> str:
+        if self._privacy_sanitizer is None:
+            return content
+        result = await self._privacy_sanitizer.sanitize(content, ctx=ctx, uri=uri)
+        if result.ambiguous_references:
+            raise InvalidArgumentError(
+                "Content contains a Privacy value mapped to multiple fields; "
+                "remove the duplicate mapping or insert the intended reference explicitly",
+                details={
+                    "uri": uri,
+                    "candidate_references": [
+                        list(candidates) for candidates in result.ambiguous_references
+                    ],
+                },
+            )
+        return result.content
+
+    async def _sanitize_batch_operations(
+        self,
+        operations: list[dict[str, Any]],
+        *,
+        ctx: RequestContext,
+    ) -> None:
+        if self._privacy_sanitizer is None:
+            return
+        for operation in operations:
+            content = operation.get("content")
+            uri = operation.get("uri")
+            if isinstance(content, str) and isinstance(uri, str):
+                operation["content"] = await self._sanitize_text(content, uri=uri, ctx=ctx)
 
     async def write(
         self,
@@ -209,6 +264,51 @@ class ContentWriteCoordinator:
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
+        return_terminal_result = wait and get_task_context() is None
+
+        async def execute() -> Dict[str, Any]:
+            context = get_task_context()
+            wait_for_queues = not (
+                return_terminal_result and context is not None and context.work_id is not None
+            )
+            return await self._write(
+                uri=uri,
+                content=content,
+                ctx=ctx,
+                mode=mode,
+                wait=wait,
+                processing_mode=processing_mode,
+                tags=tags,
+                tag_mode=tag_mode,
+                acl=acl,
+                wait_for_queues=wait_for_queues,
+            )
+
+        result, _task_id = await run_tracked_operation(
+            "content_write",
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            operation=execute,
+            wait=wait,
+            resource_id=uri,
+            return_terminal_result=return_terminal_result,
+        )
+        return result
+
+    async def _write(
+        self,
+        *,
+        uri: str,
+        content: str,
+        ctx: RequestContext,
+        mode: str = "replace",
+        wait: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        tags: list[str] | None = None,
+        tag_mode: str = "replace",
+        acl: AclSpec | Dict[str, Any] | None = None,
+        wait_for_queues: bool = True,
+    ) -> Dict[str, Any]:
         self._validate_mode(mode)
         processing_mode = normalize_processing_mode(processing_mode)
         normalized_uri = normalize_storage_target_uri(
@@ -216,6 +316,7 @@ class ContentWriteCoordinator:
         )
         self._ensure_content_write_policy(normalized_uri)
         await self._viking_fs._ensure_access(normalized_uri, ctx, action=AclAction.WRITE)
+        content = await self._sanitize_text(content, uri=normalized_uri, ctx=ctx)
         ingest_options = IngestOptions.from_search_tags(tags, mode=tag_mode)
         if acl is not None:
             ingest_options = replace(
@@ -252,6 +353,7 @@ class ContentWriteCoordinator:
                 ctx=ctx,
                 telemetry_id=telemetry_id,
                 ingest_options=ingest_options,
+                wait_for_queues=wait_for_queues,
             )
 
         return await self._write_direct_with_refresh(
@@ -266,6 +368,7 @@ class ContentWriteCoordinator:
             telemetry_id=telemetry_id,
             processing_mode=processing_mode,
             ingest_options=ingest_options,
+            wait_for_queues=wait_for_queues,
         )
 
     async def batch_write(
@@ -278,12 +381,54 @@ class ContentWriteCoordinator:
         skip_conflicts: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
+        return_terminal_result = wait and get_task_context() is None
+
+        async def execute() -> Dict[str, Any]:
+            context = get_task_context()
+            wait_for_queues = not (
+                return_terminal_result and context is not None and context.work_id is not None
+            )
+            return await self._batch_write(
+                root_uri=root_uri,
+                operations=operations,
+                ctx=ctx,
+                wait=wait,
+                skip_conflicts=skip_conflicts,
+                processing_mode=processing_mode,
+                wait_for_queues=wait_for_queues,
+            )
+
+        result, _task_id = await run_tracked_operation(
+            "content_batch_write",
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            operation=execute,
+            wait=wait,
+            resource_id=root_uri,
+            accept_failed_result=_result_has_queue_errors if return_terminal_result else None,
+            return_terminal_result=return_terminal_result,
+        )
+        if return_terminal_result:
+            self._raise_refresh_errors(result.get("queue_status", {}))
+        return result
+
+    async def _batch_write(
+        self,
+        *,
+        root_uri: str,
+        operations: list[dict[str, Any]],
+        ctx: RequestContext,
+        wait: bool = True,
+        skip_conflicts: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        wait_for_queues: bool = True,
+    ) -> Dict[str, Any]:
         """Write a bundle under one directory, then refresh it as a batch.
 
         Each operation follows the same create/replace/append semantics as ``write``;
         ``upsert`` is available for callers that already hold the desired final tree.
         All target files stay locked from state validation through the last write,
-        while unrelated files remain writable. Refresh starts after the locks are released.
+        while unrelated files remain writable. Locks are released after refresh completes.
         Derived summaries are generated once per batch. Operation count and content size have
         no application-level quotas; all operations undergo access and path validation.
         With skip_conflicts, changed, missing or occupied targets are returned in
@@ -296,6 +441,7 @@ class ContentWriteCoordinator:
         normalized_operations = await self._normalize_batch_operations(
             normalized_root, operations, ctx=ctx
         )
+        await self._sanitize_batch_operations(normalized_operations, ctx=ctx)
 
         target_paths = [
             self._viking_fs._uri_to_path(operation["uri"], ctx=ctx)
@@ -321,7 +467,6 @@ class ContentWriteCoordinator:
         prepared_resources: dict[str, _PreparedInlineResource] = {}
         committed_resource_plans: list[_PreparedInlineResource] = []
         write_error: Exception | None = None
-        lock_settled = False
         try:
             for operation in normalized_operations:
                 uri = operation["uri"]
@@ -441,29 +586,20 @@ class ContentWriteCoordinator:
                         refresh_kinds[uri] = "added"
         except BaseException:
             await self._viking_fs._async_agfs.pathlock_release(lease)
-            lock_settled = True
             raise
 
         telemetry_id = get_current_telemetry().telemetry_id
-        request_registered = False
-        enqueue_barrier_id: str | None = None
-        handoff_pending = False
+        coordinator_work_id: str | None = None
         refresh_outcome: Optional[_BatchRefreshOutcome] = None
         try:
             if refresh_kinds or sidecar_directories or committed_resource_plans:
-                if telemetry_id:
-                    tracker = get_request_wait_tracker()
-                    tracker.register_request(telemetry_id)
-                    request_registered = True
-                    lock_handoff = await self._viking_fs._async_agfs.pathlock_to_handoff(lease)
-                    _, enqueue_barrier_id = await self._enqueue_lock_coordinator(
-                        root_uri=normalized_root,
-                        context_type=context_type_for_uri(normalized_root),
-                        ctx=ctx,
-                        telemetry_id=telemetry_id,
-                        lock_handoff=lock_handoff,
-                    )
-                    handoff_pending = True
+                coordinator_work_id = await self._enqueue_lock_coordinator(
+                    root_uri=normalized_root,
+                    context_type=context_type_for_uri(normalized_root),
+                    ctx=ctx,
+                    telemetry_id=telemetry_id,
+                    lease=lease,
+                )
                 try:
                     for directory_uri, options in sorted(sidecar_directories.items()):
                         await self._vectorize_semantic_directory(
@@ -548,7 +684,6 @@ class ContentWriteCoordinator:
                             "Batch refresh failed while preserving an earlier write error",
                             exc_info=True,
                         )
-                        queue_status = None
                     else:
                         cause = str(exc).strip() or type(exc).__name__
                         raise OpenVikingError(
@@ -565,59 +700,22 @@ class ContentWriteCoordinator:
                                 "cause": cause,
                             },
                         ) from exc
-                finally:
-                    if enqueue_barrier_id is not None:
-                        get_request_wait_tracker().mark_semantic_done(
-                            telemetry_id,
-                            enqueue_barrier_id,
-                            processed_delta=0,
-                        )
-                        enqueue_barrier_id = None
-
-                if handoff_pending:
-                    try:
-                        await self._viking_fs._async_agfs.pathlock_handoff(lease)
-                    except BaseException:
-                        await self._viking_fs._async_agfs.pathlock_release(lease)
-                        lock_settled = True
-                        raise
-                else:
-                    await self._viking_fs._async_agfs.pathlock_release(lease)
-                lock_settled = True
-                queue_status = (
-                    await self._wait_for_request(telemetry_id=telemetry_id)
-                    if wait and request_registered
-                    else refresh_outcome.queue_status
-                    if refresh_outcome is not None
-                    else None
-                )
-                if wait and queue_status is not None and write_error is None:
-                    self._raise_refresh_errors(queue_status)
-                if refresh_outcome is not None and queue_status is not None:
-                    refresh_outcome = replace(refresh_outcome, queue_status=queue_status)
-            else:
-                queue_status = None
-                await self._viking_fs._async_agfs.pathlock_release(lease)
-                lock_settled = True
         finally:
-            if enqueue_barrier_id is not None:
-                get_request_wait_tracker().mark_semantic_done(
-                    telemetry_id,
-                    enqueue_barrier_id,
-                    processed_delta=0,
-                )
-            if not lock_settled:
-                if handoff_pending:
-                    try:
-                        await self._viking_fs._async_agfs.pathlock_handoff(lease)
-                    except BaseException:
-                        await self._viking_fs._async_agfs.pathlock_release(lease)
-                        raise
-                else:
-                    await self._viking_fs._async_agfs.pathlock_release(lease)
-                lock_settled = True
-            if request_registered:
-                get_request_wait_tracker().cleanup(telemetry_id)
+            await run_to_completion(
+                lambda: self._finish_write_lock(lease, coordinator_work_id, ctx)
+            )
+
+        queue_status = (
+            await self._wait_for_request(telemetry_id=telemetry_id)
+            if coordinator_work_id is not None and wait and wait_for_queues
+            else refresh_outcome.queue_status
+            if refresh_outcome is not None
+            else None
+        )
+        if wait and wait_for_queues and queue_status is not None and write_error is None:
+            self._raise_refresh_errors(queue_status)
+        if refresh_outcome is not None and queue_status is not None:
+            refresh_outcome = replace(refresh_outcome, queue_status=queue_status)
 
         if write_error is not None:
             raise write_error
@@ -631,7 +729,7 @@ class ContentWriteCoordinator:
         if skip_conflicts:
             result["conflicts"] = conflicts
         if refresh_outcome is not None:
-            semantic_status, vector_status = refresh_outcome.statuses(wait=wait)
+            semantic_status, vector_status = refresh_outcome.statuses(wait=wait and wait_for_queues)
             result["semantic_status"] = semantic_status
             result["vector_status"] = vector_status
         return result
@@ -929,14 +1027,7 @@ class ContentWriteCoordinator:
             file_abstracts=file_abstracts,
             file_ingest_options=file_ingest_options,
         )
-        if msg.telemetry_id:
-            get_request_wait_tracker().register_semantic_root(msg.telemetry_id, msg.id)
-        try:
-            await semantic_queue.enqueue(msg)
-        except Exception as exc:
-            if msg.telemetry_id:
-                get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, str(exc))
-            raise
+        await semantic_queue.enqueue(msg)
         return action
 
     async def _enqueue_lock_coordinator(
@@ -946,9 +1037,12 @@ class ContentWriteCoordinator:
         context_type: str,
         ctx: RequestContext,
         telemetry_id: str,
-        lock_handoff: dict[str, Any],
-    ) -> tuple[SemanticMsg, str]:
+        lease: Any,
+    ) -> str:
         """Enqueue the sole lease owner before scheduling request work."""
+        context = get_task_context()
+        if context is None:
+            raise RuntimeError("TaskContext is required for lock-coordinated content writes")
         queue_manager = get_queue_manager()
         semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
         msg = SemanticMsg(
@@ -961,24 +1055,42 @@ class ContentWriteCoordinator:
             role=str(ctx.role),
             skip_vectorization=True,
             telemetry_id=telemetry_id,
-            lock_handoff=lock_handoff,
+            lock_handoff=await self._viking_fs._async_agfs.pathlock_to_handoff(lease),
             generation_trigger="content_write",
             aggregate_directory=False,
             propagate_to_parent=False,
             wait_for_request_completion=True,
         )
-        enqueue_barrier_id = f"{msg.id}:enqueue"
-        tracker = get_request_wait_tracker()
-        tracker.register_semantic_root(telemetry_id, msg.id)
-        tracker.retain_request(telemetry_id, msg.id)
-        tracker.register_semantic_root(telemetry_id, enqueue_barrier_id)
+        msg.coalesce_key = f"lock-coordinator|{msg.id}"
+        receipt = await semantic_queue.enqueue(msg)
+        if not receipt.work_id:
+            raise RuntimeError("Lock coordinator was enqueued without Task Work identity")
+        return receipt.work_id
+
+    async def _finish_write_lock(
+        self,
+        lease: Any,
+        coordinator_work_id: str | None,
+        ctx: RequestContext,
+    ) -> None:
+        """Publish completion only after the producer has handed off its lease."""
+        agfs = self._viking_fs._async_agfs
+        if coordinator_work_id is None:
+            await agfs.pathlock_release(lease)
+            return
         try:
-            await semantic_queue.enqueue(msg)
-        except BaseException as exc:
-            tracker.mark_semantic_failed(telemetry_id, enqueue_barrier_id, str(exc))
-            tracker.mark_semantic_failed(telemetry_id, msg.id, str(exc))
+            await agfs.pathlock_handoff(lease)
+        except BaseException:
+            await agfs.pathlock_release(lease)
             raise
-        return msg, enqueue_barrier_id
+        context = get_task_context()
+        assert context is not None
+        await get_task_tracker().mark_enqueue_complete(
+            context.task_id,
+            coordinator_work_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+        )
 
     @staticmethod
     def _raise_refresh_errors(queue_status: Dict[str, Any]) -> None:
@@ -1453,6 +1565,7 @@ class ContentWriteCoordinator:
         telemetry_id: str,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         ingest_options: IngestOptions | None = None,
+        wait_for_queues: bool = True,
     ) -> Dict[str, Any]:
         # ``.abstract.md`` / ``.overview.md`` are generated sidecars whose body is
         # re-embedded in place (no LLM regeneration and no RNFV plan). Keep that
@@ -1469,6 +1582,7 @@ class ContentWriteCoordinator:
                 ctx=ctx,
                 telemetry_id=telemetry_id,
                 ingest_options=ingest_options,
+                wait_for_queues=wait_for_queues,
             )
 
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
@@ -1481,10 +1595,7 @@ class ContentWriteCoordinator:
             ) from exc
 
         previous_content: Optional[str] = None
-        lock_settled = False
-        request_registered = False
-        enqueue_barrier_id: str | None = None
-        handoff_pending = False
+        coordinator_work_id: str | None = None
         try:
             target_state = await self._classify_locked_write_target(uri, ctx=ctx)
             target_preexisting = target_state.preexisting
@@ -1521,20 +1632,14 @@ class ContentWriteCoordinator:
             has_async_work = bool(
                 prepared.plan.direct_index_actions or prepared.plan.file_refresh is not None
             )
-            if has_async_work and telemetry_id:
-                tracker = get_request_wait_tracker()
-                tracker.register_request(telemetry_id)
-                request_registered = True
-                lock_handoff = await self._viking_fs._async_agfs.pathlock_to_handoff(lease)
-                _, enqueue_barrier_id = await self._enqueue_lock_coordinator(
+            if has_async_work:
+                coordinator_work_id = await self._enqueue_lock_coordinator(
                     root_uri=uri,
                     context_type=context_type,
                     ctx=ctx,
                     telemetry_id=telemetry_id,
-                    lock_handoff=lock_handoff,
+                    lease=lease,
                 )
-                handoff_pending = True
-
             work = await commit_and_enqueue_plan(
                 prepared.plan,
                 ctx=ctx,
@@ -1554,68 +1659,32 @@ class ContentWriteCoordinator:
                     ingest_options.acl_update, ctx
                 )
 
-            if enqueue_barrier_id is not None:
-                get_request_wait_tracker().mark_semantic_done(
-                    telemetry_id,
-                    enqueue_barrier_id,
-                    processed_delta=0,
-                )
-                enqueue_barrier_id = None
-            if handoff_pending:
-                try:
-                    await self._viking_fs._async_agfs.pathlock_handoff(lease)
-                except BaseException:
-                    await self._viking_fs._async_agfs.pathlock_release(lease)
-                    lock_settled = True
-                    raise
-            else:
-                await self._viking_fs._async_agfs.pathlock_release(lease)
-            lock_settled = True
-
-            queue_status = (
-                await self._wait_for_request(telemetry_id=telemetry_id)
-                if wait
-                else None
-            )
-            written_bytes = len(final_bytes)
-            semantic_status, vector_status = self._plan_statuses(
-                work, wait=wait, queue_status=queue_status
-            )
-            return self._build_write_result(
-                uri=uri,
-                root_uri=root_uri,
-                context_type=context_type,
-                mode=response_mode,
-                written_bytes=written_bytes,
-                queue_status=queue_status,
-                semantic_status=semantic_status,
-                vector_status=vector_status,
-            )
-        except BaseException:
-            # Once formal content is committed it is not rolled back for a later
-            # enqueue failure. The request propagates that failure so the caller
-            # can retry; explicit writes always recommit their final bytes, even
-            # when N already matches V, which makes that retry safe while V lags F.
-            raise
         finally:
-            if enqueue_barrier_id is not None:
-                get_request_wait_tracker().mark_semantic_done(
-                    telemetry_id,
-                    enqueue_barrier_id,
-                    processed_delta=0,
-                )
-            if not lock_settled:
-                if handoff_pending:
-                    try:
-                        await self._viking_fs._async_agfs.pathlock_handoff(lease)
-                    except BaseException:
-                        await self._viking_fs._async_agfs.pathlock_release(lease)
-                        raise
-                else:
-                    await self._viking_fs._async_agfs.pathlock_release(lease)
-                lock_settled = True
-            if request_registered:
-                get_request_wait_tracker().cleanup(telemetry_id)
+            # Committed content is retained even if a later enqueue fails. Already
+            # queued work must still finish before its coordinator releases the lock.
+            await run_to_completion(
+                lambda: self._finish_write_lock(lease, coordinator_work_id, ctx)
+            )
+
+        queue_status = (
+            await self._wait_for_request(telemetry_id=telemetry_id)
+            if wait and wait_for_queues
+            else None
+        )
+        written_bytes = len(final_bytes)
+        semantic_status, vector_status = self._plan_statuses(
+            work, wait=wait and wait_for_queues, queue_status=queue_status
+        )
+        return self._build_write_result(
+            uri=uri,
+            root_uri=root_uri,
+            context_type=context_type,
+            mode=response_mode,
+            written_bytes=written_bytes,
+            queue_status=queue_status,
+            semantic_status=semantic_status,
+            vector_status=vector_status,
+        )
 
     @staticmethod
     def _ensure_explicit_write_content_action(
@@ -1692,6 +1761,7 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         telemetry_id: str,
         ingest_options: IngestOptions | None = None,
+        wait_for_queues: bool = True,
     ) -> Dict[str, Any]:
         """Re-embed a manually edited L0/L1 sidecar body without LLM regeneration."""
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
@@ -1704,7 +1774,6 @@ class ContentWriteCoordinator:
             ) from exc
 
         lock_released = False
-        request_registered = False
         try:
             # Preserve the public invariant that generated sidecars cannot be
             # materialized, while keeping the state check inside the exact lock.
@@ -1713,9 +1782,6 @@ class ContentWriteCoordinator:
             await self._write_in_place(
                 uri, content, mode=mode, ctx=ctx, lease_ref=lease, existing_raw=previous_content
             )
-            if wait and telemetry_id:
-                get_request_wait_tracker().register_request(telemetry_id)
-                request_registered = True
             vector_enqueued = await self._vectorize_abstract_overview(
                 uri=uri, ctx=ctx, ingest_options=ingest_options
             )
@@ -1723,12 +1789,12 @@ class ContentWriteCoordinator:
             lock_released = True
             queue_status = (
                 await self._wait_for_request(telemetry_id=telemetry_id)
-                if wait
+                if wait and wait_for_queues
                 else None
             )
             vector_status = self._queue_work_status(
                 requested=vector_enqueued,
-                wait=wait,
+                wait=wait and wait_for_queues,
                 queue_status=queue_status,
                 queue_name="Embedding",
             )
@@ -1746,9 +1812,6 @@ class ContentWriteCoordinator:
             if not lock_released:
                 await self._viking_fs._async_agfs.pathlock_release(lease)
             raise
-        finally:
-            if request_registered:
-                get_request_wait_tracker().cleanup(telemetry_id)
 
     async def _vectorize_abstract_overview(
         self,
@@ -1998,14 +2061,55 @@ class ContentWriteCoordinator:
         except AbstractOverviewFormatError as exc:
             raise InvalidArgumentError(str(exc)) from exc
 
+    async def _enqueue_semantic_refresh(
+        self,
+        *,
+        root_uri: str,
+        changed_uri: str,
+        context_type: str,
+        ctx: RequestContext,
+        change_type: str = "modified",
+        target_uri: str = "",
+        recursive: bool = False,
+        force_refresh: bool = False,
+        ingest_options: IngestOptions | None = None,
+        file_md5: str | None = None,
+        file_abstract: str = "",
+    ) -> FreshnessAction:
+        return await self._enqueue_semantic_refresh_changes(
+            root_uri=root_uri,
+            context_type=context_type,
+            ctx=ctx,
+            changes={change_type: [changed_uri]},
+            target_uri=target_uri,
+            recursive=recursive,
+            force_refresh=force_refresh,
+            ingest_options=ingest_options,
+            file_md5s={changed_uri: file_md5} if file_md5 else None,
+            file_abstracts={changed_uri: file_abstract} if file_abstract else None,
+        )
+
     async def _wait_for_request(
         self,
         *,
         telemetry_id: str,
     ) -> Dict[str, Any]:
-        tracker = get_request_wait_tracker()
-        await tracker.wait_for_request(telemetry_id)
-        return tracker.build_queue_status(telemetry_id)
+        del telemetry_id
+        context = get_task_context()
+        if context is None:
+            raise RuntimeError("TaskContext is required for request-scoped queue waiting")
+        work_ids = get_enqueued_work_ids()
+        tracker = get_task_tracker()
+        try:
+            if context.work_id is None:
+                await tracker.wait_for_task_work(context.task_id, timeout=None)
+            elif work_ids:
+                await tracker.wait_for_work(context.task_id, work_ids, timeout=None)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            raise DeadlineExceededError("queue processing", None) from exc
+        return await tracker.build_queue_status(
+            context.task_id, work_ids if context.work_id is not None else None
+        )
 
     async def _write_memory_with_refresh(
         self,
@@ -2019,6 +2123,7 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         telemetry_id: str,
         ingest_options: IngestOptions | None = None,
+        wait_for_queues: bool = True,
     ) -> Dict[str, Any]:
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         try:
@@ -2030,7 +2135,6 @@ class ContentWriteCoordinator:
             ) from exc
 
         released = False
-        request_registered = False
         try:
             target_state = await self._classify_locked_write_target(uri, ctx=ctx)
             is_new_file = target_state.is_new_file
@@ -2049,9 +2153,6 @@ class ContentWriteCoordinator:
             written_bytes = len(final_bytes)
             await self._viking_fs._async_agfs.pathlock_release(lease)
             released = True
-            if wait and telemetry_id and self._vikingdb_has_queue():
-                get_request_wait_tracker().register_request(telemetry_id)
-                request_registered = True
             overview_refreshed = await MemoryUpdater.refresh_schema_overview(
                 viking_fs=self._viking_fs,
                 directory_uri=root_uri,
@@ -2063,14 +2164,17 @@ class ContentWriteCoordinator:
                 uri=uri,
                 memory_type=MemoryUpdater.memory_type_from_uri(root_uri),
                 ctx=ctx,
+                strict=True,
                 ingest_options=ingest_options,
             )
             queue_status = None
-            if embedding_requested and wait:
-                queue_status = await self._wait_for_request(telemetry_id=telemetry_id)
+            if embedding_requested and wait and wait_for_queues:
+                queue_status = await self._wait_for_request(
+                    telemetry_id=telemetry_id,
+                )
             vector_status = self._queue_work_status(
                 requested=embedding_requested,
-                wait=wait,
+                wait=wait and wait_for_queues,
                 queue_status=queue_status,
                 queue_name="Embedding",
             )
@@ -2090,8 +2194,7 @@ class ContentWriteCoordinator:
                 await self._viking_fs._async_agfs.pathlock_release(lease)
             raise
         finally:
-            if request_registered:
-                get_request_wait_tracker().cleanup(telemetry_id)
+            pass
 
     def _vikingdb_has_queue(self) -> bool:
         if not self._vikingdb:

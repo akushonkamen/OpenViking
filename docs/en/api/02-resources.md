@@ -622,7 +622,7 @@ task_id      uuid-xxx
 | `errors` | array | List of errors encountered during processing |
 | `warnings` | array | Optional warnings, including partial processing or memory-linking failures |
 | `queue_status` | object | Queue summary when waiting synchronously or reading a completed task result; grouped by queue with `processed`, `requeue_count`, `error_count`, and `errors` |
-| `memory_linking` | object | Optional result of linking the resource URI to memories generated from `reason` |
+| `memory_linking` | object | Optional result of linking the resource URI to memories generated from `reason`. `status="accepted"` means the memory commit is queued, not finished: poll `commit_task_id` via `/api/v1/tasks/{task_id}` for its result |
 
 **Completed add-resource task result**
 

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from openviking_gateway.models import Upstream
@@ -17,8 +18,17 @@ VECTORS = json.loads(
 
 @pytest.mark.parametrize("vector", VECTORS, ids=lambda value: value["name"])
 def test_upstream_url_vectors(vector):
-    upstream = {"protocol": vector["protocol"], "base_url": vector["base_url"]}
-    assert upstream_url(upstream, vector["path"]) == vector["expected"]
+    upstream = {
+        "protocol": vector["protocol"],
+        "base_url": vector["base_url"],
+        "append_endpoint_path": vector.get("append_endpoint_path", True),
+    }
+    if vector.get("error"):
+        with pytest.raises(HTTPException) as error:
+            upstream_url(upstream, vector["path"], vector.get("query", ""))
+        assert error.value.status_code == 404
+    else:
+        assert upstream_url(upstream, vector["path"], vector.get("query", "")) == vector["expected"]
 
 
 @pytest.mark.parametrize(
@@ -54,6 +64,27 @@ def test_anthropic_base_rejects_v1_suffix(base):
         Upstream(name="test", protocol="anthropic", base_url=base)
 
 
+@pytest.mark.parametrize(
+    "base",
+    [
+        "https://example.test/v1?key={token}",
+        "https://{api_key}.example.test/v1",
+        "https://example.test/v1#frag",
+        "https://user:pass@example.test/v1",
+    ],
+)
+def test_base_url_rejects_other_placeholders_fragments_and_credentials(base):
+    with pytest.raises(ValidationError):
+        Upstream(name="test", protocol="chat", base_url=base)
+
+
+def test_base_url_keeps_query_and_strips_path_slash():
+    upstream = Upstream(
+        name="test", protocol="chat", base_url="https://example.test/v1/?key={api_key}"
+    )
+    assert upstream.base_url == "https://example.test/v1?key={api_key}"
+
+
 def test_endpoint_path_defaults_on_and_allows_anthropic_v1_when_off():
     default = Upstream(name="default", protocol="chat", base_url="https://example.test/v1")
     exact = Upstream(
@@ -85,3 +116,30 @@ def test_upstream_auth_headers(protocol):
     # A configured x-api-key reaches Bearer upstreams; Anthropic's own header replaces it.
     assert headers.get("x-api-key") == ("secret" if protocol == "anthropic" else "gateway-plan-key")
     assert headers["anthropic-version"] == "2023-06-01"
+
+
+@pytest.mark.parametrize(
+    ("key_header", "base_url", "expected"),
+    [
+        ("api-key", "https://example.test/chat", {"api-key": "secret"}),
+        ("x-api-key", "https://example.test/chat", {"x-api-key": "secret"}),
+        ("authorization", "https://example.test/chat?key={api_key}", {}),
+        ("api-key", "https://example.test/{api_key}/chat", {}),
+    ],
+)
+def test_key_header_and_url_placeholder(key_header, base_url, expected):
+    headers = upstream_headers(
+        {
+            "protocol": "chat",
+            "base_url": base_url,
+            "api_key": "secret",
+            "key_header": key_header,
+            "headers": {"Authorization": "x", key_header.upper(): "y", "custom": "1"},
+        },
+        {},
+    )
+    auth = {
+        k: v for k, v in headers.items() if k.lower() in {"authorization", "api-key", "x-api-key"}
+    }
+    assert auth == expected
+    assert headers["custom"] == "1"

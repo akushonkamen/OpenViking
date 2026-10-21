@@ -621,7 +621,7 @@ task_id      uuid-xxx
 | `errors` | array | 处理过程中的错误列表 |
 | `warnings` | array | 可选警告，包括部分处理失败或资源记忆关联失败 |
 | `queue_status` | object | 同步等待或已完成任务结果中的队列汇总，按队列返回 `processed`、`requeue_count`、`error_count` 和 `errors` |
-| `memory_linking` | object | （可选，仅当 `reason` 触发记忆生成时）本次资源 URI 与用户记忆的关联结果 |
+| `memory_linking` | object | （可选，仅当 `reason` 触发记忆生成时）本次资源 URI 与用户记忆的关联结果。`status="accepted"` 表示记忆提交已入队、尚未完成，需轮询 `/api/v1/tasks/{task_id}`（`commit_task_id`）获取结果 |
 
 **完成后的资源添加任务结果**
 
