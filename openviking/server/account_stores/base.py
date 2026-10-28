@@ -59,6 +59,18 @@ class AccountStore(ABC):
     @abstractmethod
     async def get_user(self, account_id: str, user_id: str) -> UserSummary | None: ...
 
+    async def get_user_membership(
+        self, account_id: str, user_id: str
+    ) -> UserSummary | None:
+        """Point-read one user for the admin membership probe.
+
+        Mirrors ``get_account``: stores whose in-memory state can lag a peer
+        process (FileStore with the watcher off) override this to refresh from
+        the persisted registry first. Query-per-call stores (MySQL) are always
+        fresh and keep the default delegation.
+        """
+        return await self.get_user(account_id, user_id)
+
     @deprecated(
         "get_user_for_management is a FileStore compatibility path and will be removed.",
         category=None,
@@ -178,7 +190,14 @@ class AccountStore(ABC):
         account_id: str,
         user_id: str,
         api_key: str,
-    ) -> None: ...
+        *,
+        expected_api_key: str | None = None,
+    ) -> None:
+        """Replace the key, atomically checking the active key when supplied.
+
+        A revoked or superseded expected key must raise UnauthenticatedError.
+        """
+        ...
 
     @abstractmethod
     async def revoke_active_api_keys(self, account_id: str, user_id: str | None = None) -> None: ...

@@ -525,10 +525,16 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
     CommandHelpSpec {
         path: &["search"],
         purpose: "Run experimental context-aware retrieval, optionally scoped to a session.",
-        examples: &[HelpItem {
-            label: "ov search \"what changed last time?\" --session-id abc123",
-            description: "Search with session context.",
-        }],
+        examples: &[
+            HelpItem {
+                label: "ov search \"what changed last time?\" --session-id abc123",
+                description: "Search with session context.",
+            },
+            HelpItem {
+                label: "ov search \"recent decisions\" --mode context",
+                description: "Assemble context ready to inject into a model.",
+            },
+        ],
         next_steps: &[HelpItem {
             label: "ov session get-session-context <id>",
             description: "Inspect the session context directly.",
@@ -578,7 +584,7 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
     },
     CommandHelpSpec {
         path: &["snapshot"],
-        purpose: "Manage workspace snapshots: commit, restore, show, diff, and walk history.",
+        purpose: "Manage workspace snapshots: commit, restore, show, compare files or directories, and walk history.",
         examples: &[
             HelpItem {
                 label: "ov snapshot commit -m \"checkpoint before refactor\" --paths viking://resources/my_project",
@@ -699,6 +705,24 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
         }],
     },
     CommandHelpSpec {
+        path: &["snapshot", "diff-paths"],
+        purpose: "List changed source files under directories between two snapshots, one page at a time.",
+        examples: &[
+            HelpItem {
+                label: "ov snapshot diff-paths --paths viking://resources/docs --from <old> --to <new> -o json",
+                description: "List added, modified, and deleted source files.",
+            },
+            HelpItem {
+                label: "ov snapshot diff-paths --paths viking://resources/docs --to <commit> --offset 100 --limit 100 -o json",
+                description: "List the next page against an empty tree; use next_offset until has_more is false.",
+            },
+        ],
+        next_steps: &[HelpItem {
+            label: "ov snapshot diff <file-uri> --from <old> --to <new>",
+            description: "Read a changed file's text diff.",
+        }],
+    },
+    CommandHelpSpec {
         path: &["snapshot", "ignore-get"],
         purpose: "Show the account-level .ovgitignore content.",
         examples: &[
@@ -766,8 +790,12 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
     },
     CommandHelpSpec {
         path: &["privacy"],
-        purpose: "Manage privacy config categories, targets, versions, and activation.",
+        purpose: "Manage privacy targets, field references, values, versions, and cleanup.",
         examples: &[
+            HelpItem {
+                label: "ov privacy tree [--category <category>] [--references]",
+                description: "List current targets and fields without revealing values.",
+            },
             HelpItem {
                 label: "ov privacy categories",
                 description: "List privacy categories.",
@@ -775,6 +803,22 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
             HelpItem {
                 label: "ov privacy get <category> <target>",
                 description: "Show active values for one target.",
+            },
+            HelpItem {
+                label: "ov privacy reference <category> <target> [field]",
+                description: "Show a reference; infer the field only when exactly one exists.",
+            },
+            HelpItem {
+                label: "ov privacy resolve <category> <target> [field]",
+                description: "Reveal a field; infer it only when exactly one exists.",
+            },
+            HelpItem {
+                label: "ov privacy upsert <category> <target> --field-<name> <value>",
+                description: "Update one field; --key and --key-<name> remain compatible.",
+            },
+            HelpItem {
+                label: "ov privacy scan --uri <viking-uri>",
+                description: "Dry-run one explicit URI under strict server resource limits.",
             },
         ],
         next_steps: &[HelpItem {
@@ -908,8 +952,8 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
         path: &["wait"],
         purpose: "Wait for queued async processing to complete.",
         examples: &[HelpItem {
-            label: "ov wait --timeout 120",
-            description: "Wait up to two minutes.",
+            label: "ov wait",
+            description: "Wait for queued processing to complete.",
         }],
         next_steps: &[
             HelpItem {
@@ -1916,6 +1960,7 @@ fn localized_command_purpose(spec: &CommandHelpSpec, language: Language) -> &str
         ["snapshot", "show"] => "查看某次提交的元数据，或指定路径下的单个文件内容。",
         ["snapshot", "log"] => "按分支遍历提交历史，最新的在前。",
         ["snapshot", "diff"] => "对比指定文件在两个快照中的内容差异。",
+        ["snapshot", "diff-paths"] => "分页列出目录中两个快照之间新增、修改和删除的源文件。",
         _ => spec.purpose,
     }
 }
@@ -2927,6 +2972,8 @@ mod tests {
         assert!(find_help.contains("Maximum final results returned"));
         assert!(search_help.contains("Maximum results per search pass."));
         assert!(search_help.contains("Search may merge multiple passes"));
+        assert!(search_help.contains("--mode <list|context>"));
+        assert!(search_help.contains("ignored in context mode"));
     }
 
     #[test]
@@ -2964,27 +3011,6 @@ mod tests {
         assert!(rendered.contains("ov status [OPTIONS]"));
         assert!(rendered.contains("ov status --verbose"));
         assert!(rendered.contains("Show full component tables"));
-    }
-
-    #[test]
-    fn curated_help_lists_timeout_for_waiting_commands() {
-        for args in [
-            ["ov", "add-resource", "--help"],
-            ["ov", "rm", "--help"],
-            ["ov", "write", "--help"],
-        ] {
-            let rendered = strip_ansi(
-                &render_command_help_request(&os_args(&args)).expect("help should render"),
-            );
-            assert!(
-                rendered.contains("--timeout <seconds>"),
-                "missing timeout option in:\n{rendered}"
-            );
-            assert!(
-                rendered.contains("seconds"),
-                "missing timeout description in:\n{rendered}"
-            );
-        }
     }
 
     #[test]
@@ -3186,7 +3212,7 @@ mod tests {
             ),
             (
                 "privacy",
-                "Manage privacy config categories, targets, versions, and activation.",
+                "Manage privacy targets, field references, values, versions, and cleanup.",
             ),
             ("admin", "Manage accounts, users, roles, and API keys."),
             (

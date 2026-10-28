@@ -2,18 +2,15 @@
 # SPDX-License-Identifier: AGPL-3.0
 """System endpoints for OpenViking HTTP Server."""
 
-from typing import Optional
-
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_request_viking_uri
-from openviking.pyagfs.exceptions import AGFSInvalidOperationError, AGFSNotSupportedError
-from openviking.server.auth import get_request_context, require_role
+from openviking.server.auth import get_request_context
 from openviking.server.dependencies import get_service
-from openviking.server.identity import AuthMode, RequestContext, Role
+from openviking.server.identity import AuthMode, RequestContext
 from openviking.server.models import Response
 from openviking.storage.viking_fs import get_viking_fs
 from openviking_cli.exceptions import UnauthenticatedError
@@ -203,9 +200,13 @@ async def system_status(
 
 
 class WaitRequest(BaseModel):
-    """Request model for wait."""
+    """Legacy wait parameters, retained for request compatibility."""
 
-    timeout: Optional[float] = None
+    timeout: float | None = Field(
+        default=None,
+        deprecated=True,
+        description="Deprecated compatibility parameter; accepted and ignored.",
+    )
 
 
 class ConsistencyRequest(BaseModel):
@@ -216,12 +217,12 @@ class ConsistencyRequest(BaseModel):
 
 @router.post("/api/v1/system/wait", tags=["system"])
 async def wait_processed(
-    request: WaitRequest,
+    request: WaitRequest | None = Body(None),
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Wait for all processing to complete."""
     service = get_service()
-    result = await service.resources.wait_processed(timeout=request.timeout)
+    result = await service.resources.wait_processed()
     return Response(status="ok", result=result)
 
 

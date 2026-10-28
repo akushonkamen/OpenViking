@@ -45,6 +45,10 @@ def _bind_token_usage_tracker(instance: Any, tracker: Any) -> None:
         return
     if hasattr(instance, "_token_tracker"):
         instance._token_tracker = tracker
+    inner = getattr(instance, "inner", None)
+    if inner is not None:
+        _bind_token_usage_tracker(inner, tracker)
+        return
     if hasattr(instance, "_vlm_instances"):
         for child in instance._vlm_instances:
             _bind_token_usage_tracker(child, tracker)

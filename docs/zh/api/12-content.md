@@ -144,14 +144,14 @@ ov overview viking://resources/docs/
 | uri | str | 是 | - | Viking URI（如 `viking://resources/docs/api.md`）或 32 字符十六进制向量记录 `id`（由 `stat()` 返回） |
 | offset | int | 否 | 0 | 起始行号（0 开始） |
 | limit | int | 否 | -1 | 读取的行数，`-1` 表示读到结尾 |
-| raw | bool | 否 | false | 返回未过滤 MEMORY_FIELDS 的原始存储内容；Python 中使用 `client.read_raw(uri)` 读取此格式。 |
+| raw | bool | 否 | false | 跳过默认脱敏和 MEMORY_FIELDS 过滤，并尝试还原占位符；Python 中使用 `client.read_raw(uri)`。 |
 
 **说明**
 
 - `read()` 只接受文件 URI。传入已存在的目录时返回 `INVALID_ARGUMENT`（HTTP `400`）。HTTP 响应的 `details` 包含 `expected: "file"`、`actual: "directory"` 和目标 `resource` URI，客户端可据此改用目录列表接口，无需解析错误消息。
 - 除 Viking URI 外，还可以传入 `stat()` 返回的 32 字符十六进制文件 `id`。服务端通过向量索引查找对应 URI 并执行相同的权限校验。由于索引是异步生成的，新返回的 ID 可能暂时无法解析；对应向量记录被删除后，按 ID 查询也会失败。这两种情况下，服务端都会返回 `NOT_FOUND`，并提示数据可能尚未索引或已经删除。
-- 公开 URI 参数接受 `resources`、`user` 和 `agent` 作用域。访问 session 文件时，使用 `viking://user/{user_id}/sessions/{session_id}/messages.jsonl`，也可以使用向后兼容的 `viking://session/{session_id}/messages.jsonl` 别名。`temp`、`queue` 等内部作用域会返回 `INVALID_URI`。
-
+- 公开 URI 参数接受 `resources`、`user` 和 `agent` 作用域。访问 session 文件时，使用 `viking://user/{user_id}/sessions/{session_id}/messages.jsonl`，或表示当前用户的 `viking://~/sessions/{session_id}/messages.jsonl`。旧的 `viking://session/...` 以及 `temp`、`queue` 等内部作用域会返回 `INVALID_URI`。
+- 敏感信息的处理：默认读取（`raw=false`）保留已有占位符，并对残留的已登记明文脱敏；`raw=true` 跳过默认脱敏，返回加载还原后的内容，该还原只影响返回内容，不修改存储文件，详见[隐私配置](../concepts/13-privacy.md)。
 
 **Python SDK**
 
@@ -218,7 +218,7 @@ ov read viking://resources/docs/api.md
 | content | str | 是 | - | 要写入的新内容 |
 | mode | str | 否 | `replace` | `replace` 覆盖已有文件、缺失时创建；`append` 追加已有文件、缺失时创建；`create` 是 `replace` 的兼容别名 |
 | wait | bool | 否 | `false` | 是否等待后台语义/向量刷新完成 |
-| timeout | float | 否 | `null` | 当 `wait=true` 时的超时时间（秒） |
+| timeout | float | 否 | None | 已废弃：仅为兼容旧请求保留，传入值会被忽略；HTTP 超时使用客户端配置 |
 | tags | string[] | 否 | 未设置 | 写入文件的显式检索标签，例如 `["team=search", "env=prod"]` |
 | tag_mode | string | 否 | `replace` | 标签更新方式：`replace` 覆盖、`append` 按 key 合并、`clear` 清空已有标签且不要求传 `tags` |
 
@@ -346,9 +346,10 @@ ov write viking://resources/docs/api.md \
 | `root_uri` | string | 是 | - | 包含所有写入目标的已存在 Resource 或 Memory 目录 |
 | `operations` | array | 是 | - | 要校验并执行的文件写入 |
 | `wait` | boolean | 否 | `true` | 是否等待语义/向量刷新 |
-| `timeout` | number | 否 | `null` | `wait=true` 时的刷新超时时间（秒） |
+| timeout | float | 否 | None | 已废弃：仅为兼容旧请求保留，传入值会被忽略；HTTP 超时使用客户端配置 |
 | `telemetry` | boolean/object | 否 | `false` | 是否返回操作遥测信息 |
 | `processing_mode` | string | 否 | `semantic_and_vectors` | 整批统一的处理模式：`semantic_and_vectors` 或 `vectors_only` |
+| `defer_processing` | boolean | 否 | `false` | 只保存文件，不派发语义和向量处理；后处理由调用方安排 |
 
 每个 operation 包含：
 
@@ -370,7 +371,7 @@ ov write viking://resources/docs/api.md \
 - `create`、`replace`、`upsert` 是“写成请求最终正文”的兼容写法：文件存在时覆盖，缺失时创建。`append` 在文件存在时追加，文件缺失时以请求正文创建文件。
 - `processing_mode` 对整个 batch 生效，不能在不同 operation 中混用语义模式；`vectors_only` 不刷新父目录语义，只维护变化文件的向量。
 - `tags`、`tag_mode` 与 `acl` 按 operation 生效；tags 会随该文件首次向量 upsert 写入，`clear` 不要求传 `tags` 并会忽略同时传入的标签值。
-- 整批先获取所有目标文件的精确锁，再校验文件状态并写入；同一目录下不涉及相同文件的写入可以并行，重叠文件的写入或父目录删除、移动仍会冲突。所有文件写完并释放锁后才启动语义处理，统一刷新受影响的 `.overview.md` / `.abstract.md`。
+- 整批先获取所有目标文件的精确锁，再校验文件状态并写入；同一目录下不涉及相同文件的写入可以并行，重叠文件的写入或父目录删除、移动仍会冲突。未启用延迟模式时，异步处理持有文件锁直到关联工作结束，统一刷新受影响的 `.overview.md` / `.abstract.md`。
 - 资源父目录刷新与 `write()` 一样采用尽力更新：L0/L1 锁冲突时跳过目录刷新及对应目录向量更新，保留原文和文件自身的处理，不保证自动补刷。
 - 底层 I/O 中途失败时，本批次较早完成的写入仍可能已经可见。
 - 已存在的 `.abstract.md` / `.overview.md` 可以 replace 或 append；系统会保留并校验受保护的 OKF metadata，并只重建对应目录实际存在的 L0/L1 向量。
