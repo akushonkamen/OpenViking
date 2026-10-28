@@ -7,8 +7,9 @@ tests pin invariants rather than tokenizer constants:
 
 - CJK characters carry headroom over the 1 token/char floor (measured
   1.4-1.7 tokens/char on CJK-heavy byte-level tokenizers);
-- non-ASCII, non-CJK characters cost at least 1 token each instead of
-  falling into the cheap ``other/4`` bucket;
+- non-ASCII, non-CJK characters are priced at their UTF-8 byte length, the
+  ceiling a byte-level tokenizer cannot exceed, instead of the cheap
+  ``other/4`` bucket;
 - ``estimate(truncate(text, n)) <= n`` — the truncation suffix is counted
   inside the budget it is appended to.
 
@@ -38,6 +39,7 @@ CJK_PROBE_CHARS = (
     "\U0002ebf0",  # CJK Extension I (astral plane)
     "\U00030000",  # CJK Extension G (astral plane)
     "\U00031350",  # CJK Extension H (astral plane)
+    "\U0001f200",  # Enclosed Ideographic Supplement: 🈀
 )
 NON_CJK_NON_ASCII_CHARS = (
     "\U0001f44d",  # emoji: 👍 (used to estimate ceil(1/4) via the other/4 bucket)
@@ -63,10 +65,19 @@ def test_cjk_priced_with_headroom_over_floor():
     )
 
 
-def test_non_ascii_non_cjk_costs_at_least_one_token_per_char():
+def test_non_ascii_non_cjk_priced_at_byte_ceiling():
+    # A byte-level tokenizer cannot spend more tokens than a string has bytes,
+    # so the byte length is the upper bound this class has to charge. Pricing
+    # these at 1 token/char undercounts 4-byte emoji and 3-byte Indic/Thai text.
     for char in NON_CJK_NON_ASCII_CHARS:
+        expected = len(char.encode("utf-8"))
         text = char * 100
-        assert estimate_embedding_input_tokens(text) >= len(text)
+        assert estimate_embedding_input_tokens(text) == expected * 100
+
+
+def test_emoji_keeps_more_than_one_token_per_char():
+    for emoji in ("\U0001f44d", "\U0001f1e8\U0001f1f3", "\U0001f468\u200d\U0001f469\u200d\U0001f467"):
+        assert estimate_embedding_input_tokens(emoji) >= len(emoji) * 2
 
 
 class TestTruncateStaysWithinBound:
