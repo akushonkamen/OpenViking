@@ -16,9 +16,11 @@ DEFAULT_CJK_TOKENS_PER_CHAR = 2.0
 
 # Code point ranges priced at ``DEFAULT_CJK_TOKENS_PER_CHAR``: CJK ideographs
 # (all published extension blocks), kana, hangul (jamo blocks included), CJK
-# punctuation, and fullwidth forms. Unassigned gaps inside these planes are
-# priced conservatively as well. Chars outside these ranges but above ASCII
-# cost at least 1 token each.
+# punctuation, enclosed ideographs and fullwidth forms. Unassigned gaps inside
+# these planes are priced conservatively as well. Chars outside these ranges
+# but above ASCII are priced at their UTF-8 byte length, which is the hard
+# ceiling for a byte-level tokenizer: no byte sequence can cost more tokens
+# than it has bytes.
 _CJK_RANGES: tuple[tuple[int, int], ...] = (
     (0x1100, 0x11FF),  # Hangul Jamo
     (0x3000, 0x303F),  # CJK Symbols and Punctuation
@@ -32,6 +34,7 @@ _CJK_RANGES: tuple[tuple[int, int], ...] = (
     (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
     (0xFF00, 0xFFEF),  # Halfwidth and Fullwidth Forms
     (0x1B000, 0x1B16F),  # Kana Supplement
+    (0x1F200, 0x1F2FF),  # Enclosed Ideographic Supplement
     (0x20000, 0x2FA1F),  # Plane 2: CJK Ext B-F, I + Compat Ideographs Supp
     (0x30000, 0x323AF),  # CJK Extensions G-H
 )
@@ -49,14 +52,16 @@ def estimate_embedding_input_tokens(
 
     The result is a conservative upper bound per script class: CJK characters
     are priced at ``cjk_tokens_per_char`` (default
-    ``DEFAULT_CJK_TOKENS_PER_CHAR``), other non-ASCII characters at >= 1 token
-    each, and ASCII text at roughly 4 chars per token.
+    ``DEFAULT_CJK_TOKENS_PER_CHAR``), a measured-with-headroom ratio rather than
+    a hard ceiling; other non-ASCII characters at their UTF-8 byte length, which
+    is the ceiling a byte-level tokenizer cannot exceed; and ASCII text at
+    roughly 4 chars per token.
     """
     if not text:
         return 0
     ratio = DEFAULT_CJK_TOKENS_PER_CHAR if cjk_tokens_per_char is None else cjk_tokens_per_char
     cjk_chars = 0
-    non_ascii_chars = 0
+    other_non_ascii_tokens = 0
     ascii_chars = 0
     for char in text:
         code_point = ord(char)
@@ -65,8 +70,12 @@ def estimate_embedding_input_tokens(
         elif _is_cjk(code_point):
             cjk_chars += 1
         else:
-            non_ascii_chars += 1
-    return max(1, math.ceil(cjk_chars * ratio) + non_ascii_chars + math.ceil(ascii_chars / 4))
+            # Byte length is the ceiling, not a measurement: a byte-level
+            # tokenizer can split an unseen sequence into one token per byte,
+            # and a 4-byte emoji priced at 1 token is how the guard used to
+            # undercount chat text.
+            other_non_ascii_tokens += len(char.encode("utf-8"))
+    return max(1, math.ceil(cjk_chars * ratio) + other_non_ascii_tokens + math.ceil(ascii_chars / 4))
 
 
 def truncate_embedding_input(
