@@ -4,49 +4,114 @@
 
 from __future__ import annotations
 
-import re
+import math
 
 EMBEDDING_TRUNCATION_SUFFIX = "\n...(truncated for embedding)"
-_CJK_RUN = re.compile("[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
+
+# Headroom over the 1 token/char floor that CJK-heavy byte-level tokenizers
+# actually charge (measured 1.4-1.7 tokens/char on Zhipu embedding-3-style
+# providers). The estimate is consumed as an upper bound by the truncation
+# guard, so the default rounds up to 2.0 instead of trusting the floor.
+DEFAULT_CJK_TOKENS_PER_CHAR = 2.0
+
+# Code point ranges priced at ``DEFAULT_CJK_TOKENS_PER_CHAR``: CJK ideographs
+# (all published extension blocks), kana, hangul (jamo blocks included), CJK
+# punctuation, enclosed ideographs and fullwidth forms. Unassigned gaps inside
+# these planes are priced conservatively as well. Chars outside these ranges
+# but above ASCII are priced at their UTF-8 byte length, which is the hard
+# ceiling for a byte-level tokenizer: no byte sequence can cost more tokens
+# than it has bytes.
+_CJK_RANGES: tuple[tuple[int, int], ...] = (
+    (0x1100, 0x11FF),  # Hangul Jamo
+    (0x3000, 0x303F),  # CJK Symbols and Punctuation
+    (0x3040, 0x30FF),  # Hiragana + Katakana
+    (0x3130, 0x318F),  # Hangul Compatibility Jamo
+    (0x3400, 0x4DBF),  # CJK Extension A
+    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
+    (0xA960, 0xA97F),  # Hangul Jamo Extended-A
+    (0xAC00, 0xD7AF),  # Hangul Syllables
+    (0xD7B0, 0xD7FF),  # Hangul Jamo Extended-B
+    (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
+    (0xFF00, 0xFFEF),  # Halfwidth and Fullwidth Forms
+    (0x1B000, 0x1B16F),  # Kana Supplement
+    (0x1F200, 0x1F2FF),  # Enclosed Ideographic Supplement
+    (0x20000, 0x2FA1F),  # Plane 2: CJK Ext B-F, I + Compat Ideographs Supp
+    (0x30000, 0x323AF),  # CJK Extensions G-H
+)
+
+
+def _is_cjk(code_point: int) -> bool:
+    return any(low <= code_point <= high for low, high in _CJK_RANGES)
+
+
+def estimate_embedding_input_tokens(
+    text: str,
+    cjk_tokens_per_char: float | None = None,
+) -> int:
+    """Estimate tokens for the raw text embedding input guard.
+
+    The result is a conservative upper bound per script class: CJK characters
+    are priced at ``cjk_tokens_per_char`` (default
+    ``DEFAULT_CJK_TOKENS_PER_CHAR``), a measured-with-headroom ratio rather than
+    a hard ceiling; other non-ASCII characters at their UTF-8 byte length, which
+    is the ceiling a byte-level tokenizer cannot exceed; and ASCII text at
+    roughly 4 chars per token.
+    """
+    if not text:
+        return 0
+    ratio = DEFAULT_CJK_TOKENS_PER_CHAR if cjk_tokens_per_char is None else cjk_tokens_per_char
+    cjk_chars = 0
+    other_non_ascii_tokens = 0
+    ascii_chars = 0
+    for char in text:
+        code_point = ord(char)
+        if code_point <= 0x7F:
+            ascii_chars += 1
+        elif _is_cjk(code_point):
+            cjk_chars += 1
+        else:
+            # Byte length is the ceiling, not a measurement: a byte-level
+            # tokenizer can split an unseen sequence into one token per byte,
+            # and a 4-byte emoji priced at 1 token is how the guard used to
+            # undercount chat text.
+            other_non_ascii_tokens += len(char.encode("utf-8"))
+    return max(1, math.ceil(cjk_chars * ratio) + other_non_ascii_tokens + math.ceil(ascii_chars / 4))
 
 
 def truncate_embedding_input(
     text: str,
     max_tokens: int,
     suffix: str = EMBEDDING_TRUNCATION_SUFFIX,
+    cjk_tokens_per_char: float | None = None,
 ) -> str:
-    """Keep the original estimated-token prefix budget, then append the marker."""
+    """Trim raw text before embedding using the local estimate above.
+
+    The suffix is counted inside ``max_tokens`` so the returned string still
+    estimates within the bound it enforces. When the budget cannot fit the
+    suffix, the suffix alone is returned, mirroring the ``max_tokens <= 0``
+    precedent.
+    """
     if not text:
         return text
     if max_tokens <= 0:
         return suffix.lstrip()
-    if len(text) <= max_tokens:
+    if estimate_embedding_input_tokens(text, cjk_tokens_per_char) <= max_tokens:
         return text
 
-    # Quarter-token units preserve the original estimate without rounding each
-    # run. No prefix longer than 4 * max_tokens can fit, even with only ASCII.
-    max_units = max_tokens * 4
-    if text.isascii():
-        return text if len(text) <= max_units else text[:max_units].rstrip() + suffix
-    scan_end = min(len(text), max_units + 1)
-    units = position = 0
-    for match in _CJK_RUN.finditer(text, 0, scan_end):
-        start, end = match.span()
-        # Ordinary characters preceding the CJK run cost one unit each.
-        if units + start - position > max_units:
-            prefix_end = position + max_units - units
-            return text[:prefix_end].rstrip() + suffix
-        units += start - position
-        if units + (end - start) * 4 > max_units:
-            prefix_end = start + (max_units - units) // 4
-            return text[:prefix_end].rstrip() + suffix
-        units += (end - start) * 4
-        position = end
+    suffix_tokens = estimate_embedding_input_tokens(suffix, cjk_tokens_per_char)
+    if suffix_tokens >= max_tokens:
+        return suffix.lstrip()
+    prefix_budget = max_tokens - suffix_tokens
 
-    if units + scan_end - position <= max_units:
-        return text
-    prefix_end = position + max_units - units
-    return text[:prefix_end].rstrip() + suffix
+    low = 0
+    high = len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if estimate_embedding_input_tokens(text[:mid], cjk_tokens_per_char) <= prefix_budget:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low].rstrip() + suffix
 
 
 def resolve_embedding_max_input_tokens(
